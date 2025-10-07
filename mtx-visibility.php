@@ -75,10 +75,7 @@ final class MTX_Elementor_MemberPress_Visibility {
    * Initialize Elementor hooks
    */
   public function init_elementor_hooks() {
-    if ( ! $this->is_plugin_ready() ) {
-      return;
-    }
-    
+    // Always register controls - don't require MemberPress to be ready
     // Add controls to Elementor UI - use specific hooks for each element type
     add_action( 'elementor/element/common/section_advanced/after_section_end',   [ $this, 'register_controls' ], 10, 2 );
     add_action( 'elementor/element/section/section_advanced/after_section_end',  [ $this, 'register_controls' ], 10, 2 );
@@ -94,8 +91,10 @@ final class MTX_Elementor_MemberPress_Visibility {
     // Container (Flexbox) newer filter
     add_filter( 'elementor/frontend/container/should_render', [ $this, 'should_render' ], 10, 2 );
     
-    // Add cache invalidation hooks
-    $this->add_cache_invalidation_hooks();
+    // Add cache invalidation hooks only if MemberPress is ready
+    if ( $this->is_plugin_ready() ) {
+      $this->add_cache_invalidation_hooks();
+    }
   }
   
   /**
@@ -159,10 +158,6 @@ final class MTX_Elementor_MemberPress_Visibility {
    * @param array $args
    */
   public function register_controls( $element, $args ) {
-    if ( ! $this->is_plugin_ready() ) {
-      return;
-    }
-    
     // Check if controls already exist to prevent duplicates
     $controls = method_exists( $element, 'get_controls' ) ? $element->get_controls() : [];
     if ( is_array( $controls ) && array_key_exists( 'mtx_mepr_enable', $controls ) ) return;
@@ -314,69 +309,59 @@ final class MTX_Elementor_MemberPress_Visibility {
       return false;
     }
 
-    // ---- Any active membership (IDs blank) — robust path ----
-    if ( empty( $ids ) ) {
-      // Prefer built-in MemberPress helpers if present
-      // Try user method for active product subs (may return IDs)
-      if ( method_exists( $user, 'active_product_subscriptions' ) ) {
-        try {
-          $active = (array) $user->active_product_subscriptions('ids');
-          $ok_any = ! empty( $active );
-          $result = (bool) $ok_any;
-          self::$member_cache[$cache_key] = [ 'result' => $result, 'timestamp' => time() ];
-          return $result;
-        } catch ( \Exception $e ) {
-          // If the method fails, fall through to fallback
-        }
-      }
-
-      // Fallback: scan known product IDs
-      $ids = $this->get_all_plan_ids();
-      if ( empty( $ids ) ) {
-        self::$member_cache[$cache_key] = [ 'result' => false, 'timestamp' => time() ];
-        return false;
-      }
-    }
-
-    // ---- Specific IDs path ----
-    $checks = [];
-    foreach ( (array) $ids as $pid ) {
-      // Validate product ID
-      $pid = (int) $pid;
-      if ( $pid <= 0 ) {
-        $checks[] = false;
-        continue;
-      }
-
-      // Try different MemberPress API methods based on version
-      $is_active = false;
-      
+    // Get active product IDs using the most reliable MemberPress method
+    $active_ids = [];
+    
+    // Primary method: active_product_subscriptions with 'ids' parameter (most reliable)
+    if ( method_exists( $user, 'active_product_subscriptions' ) ) {
       try {
-        if ( method_exists( $user, 'is_already_subscribed_to' ) ) {
-          $is_active = (bool) $user->is_already_subscribed_to( $pid );
-        } elseif ( method_exists( $user, 'is_active_member' ) ) {
-          $is_active = (bool) $user->is_active_member( $pid );
-        } else {
-          // Fallback: check active subscriptions directly
-          if ( method_exists( $user, 'active_product_subscriptions' ) ) {
-            $active_subs = $user->active_product_subscriptions();
-            if ( is_array( $active_subs ) ) {
-              $is_active = in_array( $pid, array_map( 'intval', $active_subs ), true );
-            }
-          }
+        $active_ids_array = $user->active_product_subscriptions( 'ids' );
+        if ( is_array( $active_ids_array ) ) {
+          $active_ids = array_merge( $active_ids, $active_ids_array );
         }
       } catch ( \Exception $e ) {
-        // If any method fails, assume not active for security
-        $is_active = false;
+        // If the method fails, fall through to fallback
       }
-      
-      $checks[] = $is_active;
+    }
+    
+    // Fallback method: is_active_member for each product (for older MemberPress versions)
+    if ( empty( $active_ids ) && method_exists( $user, 'is_active_member' ) ) {
+      $all_plan_ids = $this->get_all_plan_ids();
+      foreach ( $all_plan_ids as $plan_id ) {
+        if ( $user->is_active_member( $plan_id ) ) {
+          $active_ids[] = $plan_id;
+        }
+      }
+    }
+    
+    $active_ids = array_unique( array_filter( array_map( 'absint', $active_ids ) ) );
+
+    // If no IDs specified: "any active membership?"
+    if ( empty( $ids ) ) {
+      $ok = ! empty( $active_ids );
+      self::$member_cache[$cache_key] = [ 'result' => $ok, 'timestamp' => time() ];
+      return $ok;
     }
 
-    $ok = ( $require === 'all' ) ? ! in_array(false, $checks, true) : in_array(true, $checks, true);
+    // With specific IDs: set comparison against active_ids
+    $ids = array_filter( array_map( 'absint', (array) $ids ) );
+    if ( ! empty( $active_ids ) ) {
+      $ok = ( $require === 'all' )
+        ? empty( array_diff( $ids, $active_ids ) )       // must have ALL IDs
+        : ( count( array_intersect( $ids, $active_ids ) ) > 0 ); // ANY overlap
+      self::$member_cache[$cache_key] = [ 'result' => $ok, 'timestamp' => time() ];
+      return $ok;
+    }
+
+    // Fallback (older MP): per-ID check
+    $checks = [];
+    foreach ( $ids as $pid ) {
+      $checks[] = (bool) ( method_exists( $user, 'is_active_member' )
+                ? $user->is_active_member( (int) $pid )
+                : false );
+    }
+    $ok = ( $require === 'all' ) ? ! in_array( false, $checks, true ) : in_array( true, $checks, true );
     self::$member_cache[$cache_key] = [ 'result' => $ok, 'timestamp' => time() ];
-    
-    
     return $ok;
   }
 
@@ -420,10 +405,10 @@ final class MTX_Elementor_MemberPress_Visibility {
    * Add hooks for cache invalidation when memberships change
    */
   private function add_cache_invalidation_hooks() {
-    // Clear cache when user memberships change
-    add_action( 'mepr_subscription_status_changed', [ $this, 'clear_user_cache' ], 10, 1 );
-    add_action( 'mepr_subscription_created', [ $this, 'clear_user_cache' ], 10, 1 );
-    add_action( 'mepr_subscription_deleted', [ $this, 'clear_user_cache' ], 10, 1 );
+    // Clear cache when user memberships change - use correct hook parameters
+    add_action( 'mepr_subscription_status_changed', [ $this, 'clear_user_cache_from_sub' ], 10, 3 );
+    add_action( 'mepr_subscription_created', [ $this, 'clear_user_cache_from_sub_id' ], 10, 1 );
+    add_action( 'mepr_subscription_deleted', [ $this, 'clear_user_cache_from_sub_id' ], 10, 1 );
     
     // Clear plan cache when MemberPress products are updated
     add_action( 'save_post', [ $this, 'maybe_clear_plan_cache' ], 10, 2 );
@@ -451,6 +436,35 @@ final class MTX_Elementor_MemberPress_Visibility {
         unset( self::$member_cache[$key] );
       }
     }
+  }
+  
+  /**
+   * Clear user cache from subscription status change hook
+   *
+   * @param string $old_status Old subscription status
+   * @param string $new_status New subscription status  
+   * @param int $sub_id Subscription ID
+   */
+  public function clear_user_cache_from_sub( $old_status, $new_status, $sub_id ) {
+    $this->clear_user_cache_from_sub_id( $sub_id );
+  }
+  
+  /**
+   * Clear user cache from subscription ID
+   *
+   * @param int $sub_id Subscription ID
+   */
+  public function clear_user_cache_from_sub_id( $sub_id ) {
+    if ( ! class_exists( 'MeprSubscription' ) ) {
+      return;
+    }
+    
+    $sub = new \MeprSubscription( (int) $sub_id );
+    if ( ! is_object( $sub ) || empty( $sub->user_id ) ) {
+      return;
+    }
+    
+    $this->clear_user_cache( (int) $sub->user_id );
   }
   
   /**
@@ -518,3 +532,231 @@ final class MTX_Elementor_MemberPress_Visibility {
 add_action( 'plugins_loaded', function(){ 
   MTX_Elementor_MemberPress_Visibility::instance(); 
 } );
+
+/**
+ * MTX: Menu Item Visibility Settings
+ * Adds visibility controls to WordPress menu items in Appearance → Menus
+ */
+
+// Add custom fields to menu items
+add_action('wp_nav_menu_item_custom_fields', function($item_id, $item, $depth, $args) {
+  $visibility_type = get_post_meta($item_id, '_mtx_menu_visibility_type', true);
+  $membership_ids = get_post_meta($item_id, '_mtx_menu_membership_ids', true);
+  $require_all = get_post_meta($item_id, '_mtx_menu_require_all', true);
+  
+  ?>
+  <div class="field-mtx-visibility description description-wide">
+    <h4><?php _e('MTX Visibility Settings', 'mtx-visibility'); ?></h4>
+    
+    <p class="field-visibility-type description">
+      <label for="edit-menu-item-visibility-type-<?php echo $item_id; ?>">
+        <?php _e('Visibility Rule', 'mtx-visibility'); ?><br />
+        <select id="edit-menu-item-visibility-type-<?php echo $item_id; ?>" 
+                class="widefat" 
+                name="menu-item-mtx-visibility-type[<?php echo $item_id; ?>]">
+          <option value=""><?php _e('Always visible', 'mtx-visibility'); ?></option>
+          <option value="logged-in" <?php selected($visibility_type, 'logged-in'); ?>><?php _e('Logged-in users only', 'mtx-visibility'); ?></option>
+          <option value="logged-out" <?php selected($visibility_type, 'logged-out'); ?>><?php _e('Logged-out users only', 'mtx-visibility'); ?></option>
+          <option value="membership" <?php selected($visibility_type, 'membership'); ?>><?php _e('Specific membership plans', 'mtx-visibility'); ?></option>
+        </select>
+      </label>
+    </p>
+    
+    <p class="field-membership-ids description" style="<?php echo $visibility_type === 'membership' ? '' : 'display:none;'; ?>">
+      <label for="edit-menu-item-membership-ids-<?php echo $item_id; ?>">
+        <?php _e('Membership Plan IDs (comma-separated)', 'mtx-visibility'); ?><br />
+        <input type="text" 
+               id="edit-menu-item-membership-ids-<?php echo $item_id; ?>" 
+               class="widefat" 
+               name="menu-item-mtx-membership-ids[<?php echo $item_id; ?>]"
+               value="<?php echo esc_attr($membership_ids); ?>"
+               placeholder="e.g. 12,34,56" />
+        <small><?php _e('Leave empty to show to any active member', 'mtx-visibility'); ?></small>
+      </label>
+    </p>
+    
+    <p class="field-require-all description" style="<?php echo $visibility_type === 'membership' ? '' : 'display:none;'; ?>">
+      <label for="edit-menu-item-require-all-<?php echo $item_id; ?>">
+        <input type="checkbox" 
+               id="edit-menu-item-require-all-<?php echo $item_id; ?>" 
+               name="menu-item-mtx-require-all[<?php echo $item_id; ?>]"
+               value="1" 
+               <?php checked($require_all, '1'); ?> />
+        <?php _e('Require ALL specified plans (instead of ANY)', 'mtx-visibility'); ?>
+      </label>
+    </p>
+  </div>
+  
+  <script>
+  jQuery(document).ready(function($) {
+    $('#edit-menu-item-visibility-type-<?php echo $item_id; ?>').change(function() {
+      var isMembership = $(this).val() === 'membership';
+      $(this).closest('.field-mtx-visibility').find('.field-membership-ids, .field-require-all').toggle(isMembership);
+    });
+  });
+  </script>
+  <?php
+}, 10, 4);
+
+// Save menu item custom fields
+add_action('wp_update_nav_menu_item', function($menu_id, $menu_item_db_id, $args) {
+  // Save visibility type
+  if (isset($_POST['menu-item-mtx-visibility-type'][$menu_item_db_id])) {
+    update_post_meta($menu_item_db_id, '_mtx_menu_visibility_type', sanitize_text_field($_POST['menu-item-mtx-visibility-type'][$menu_item_db_id]));
+  } else {
+    delete_post_meta($menu_item_db_id, '_mtx_menu_visibility_type');
+  }
+  
+  // Save membership IDs
+  if (isset($_POST['menu-item-mtx-membership-ids'][$menu_item_db_id])) {
+    $ids = sanitize_text_field($_POST['menu-item-mtx-membership-ids'][$menu_item_db_id]);
+    if (!empty($ids)) {
+      update_post_meta($menu_item_db_id, '_mtx_menu_membership_ids', $ids);
+    } else {
+      delete_post_meta($menu_item_db_id, '_mtx_menu_membership_ids');
+    }
+  } else {
+    delete_post_meta($menu_item_db_id, '_mtx_menu_membership_ids');
+  }
+  
+  // Save require all setting
+  if (isset($_POST['menu-item-mtx-require-all'][$menu_item_db_id])) {
+    update_post_meta($menu_item_db_id, '_mtx_menu_require_all', '1');
+  } else {
+    delete_post_meta($menu_item_db_id, '_mtx_menu_require_all');
+  }
+}, 10, 3);
+
+// Add CSS for better styling
+add_action('admin_head-nav-menus.php', function() {
+  ?>
+  <style>
+  .field-mtx-visibility {
+    border-top: 1px solid #eee;
+    margin-top: 10px;
+    padding-top: 10px;
+  }
+  .field-mtx-visibility h4 {
+    margin: 0 0 10px 0;
+    color: #333;
+  }
+  .field-mtx-visibility .description {
+    margin-bottom: 8px;
+  }
+  .field-mtx-visibility small {
+    color: #666;
+    font-style: italic;
+  }
+  </style>
+  <?php
+});
+
+add_filter('wp_nav_menu_objects', function($items, $args) {
+  if (empty($items) || !is_array($items)) return $items;
+
+  $is_logged_in = is_user_logged_in();
+  $user_id = $is_logged_in ? get_current_user_id() : 0;
+
+   // Cache active plan IDs per request
+   static $active_plan_ids = null;
+   if ($is_logged_in && class_exists('MeprUser') && $active_plan_ids === null) {
+     $active_plan_ids = [];
+     try {
+       $user = new \MeprUser($user_id);
+       
+       // Use the same reliable method as the main plugin
+       if (method_exists($user, 'active_product_subscriptions')) {
+         $active_ids_array = $user->active_product_subscriptions('ids');
+         if (is_array($active_ids_array)) {
+           $active_plan_ids = array_merge($active_plan_ids, $active_ids_array);
+         }
+       }
+       
+       // Fallback method for older MemberPress versions
+       if (empty($active_plan_ids) && method_exists($user, 'is_active_member')) {
+         $all_plan_ids = get_posts([
+           'post_type' => 'memberpressproduct',
+           'post_status' => 'publish',
+           'numberposts' => -1,
+           'fields' => 'ids',
+           'suppress_filters' => false,
+         ]);
+         foreach ($all_plan_ids as $plan_id) {
+           if ($user->is_active_member($plan_id)) {
+             $active_plan_ids[] = $plan_id;
+           }
+         }
+       }
+     } catch (\Throwable $e) { $active_plan_ids = []; }
+     $active_plan_ids = array_unique(array_filter(array_map('absint', $active_plan_ids)));
+   }
+
+  foreach ($items as $key => $item) {
+    // Get visibility settings from menu item meta
+    $visibility_type = get_post_meta($item->ID, '_mtx_menu_visibility_type', true);
+    
+    // Skip if no visibility rule is set
+    if (empty($visibility_type)) {
+      continue;
+    }
+    
+    $should_show = true;
+    
+    // 1) Basic login gating
+    if ($visibility_type === 'logged-in' && !$is_logged_in) {
+      $should_show = false;
+    } elseif ($visibility_type === 'logged-out' && $is_logged_in) {
+      $should_show = false;
+    }
+    
+    // 2) MemberPress plan gating
+    elseif ($visibility_type === 'membership') {
+      $membership_ids = get_post_meta($item->ID, '_mtx_menu_membership_ids', true);
+      $require_all = get_post_meta($item->ID, '_mtx_menu_require_all', true) === '1';
+      
+      // If not logged in → treat as unauthorized
+      if (!$is_logged_in) {
+        $should_show = false;
+      } else {
+        // Parse membership IDs
+        $ids = [];
+        if (!empty($membership_ids)) {
+          $ids = array_filter(array_map('absint', explode(',', $membership_ids)));
+        }
+        
+        if (empty($ids)) {
+          // No specific IDs = show to any active member
+          $should_show = !empty($active_plan_ids);
+        } else {
+          // Check specific IDs
+          if (is_array($active_plan_ids) && !empty($active_plan_ids)) {
+            $should_show = $require_all
+              ? empty(array_diff($ids, $active_plan_ids))                      // has ALL
+              : (count(array_intersect($ids, $active_plan_ids)) > 0);          // has ANY
+          } elseif (class_exists('MeprUser')) {
+            // Fallback per-ID (older MP)
+            $should_show = false;
+            try {
+              $user = new \MeprUser($user_id);
+              $checks = [];
+              foreach ($ids as $pid) {
+                $checks[] = (bool)(method_exists($user,'is_active_member') ? $user->is_active_member((int)$pid) : false);
+              }
+              $should_show = $require_all ? !in_array(false,$checks,true) : in_array(true,$checks,true);
+            } catch (\Throwable $e) { $should_show = false; }
+          } else {
+            $should_show = false;
+          }
+        }
+      }
+    }
+    
+    // Hide item if it shouldn't be shown
+    if (!$should_show) {
+      unset($items[$key]);
+    }
+  }
+
+  // Reindex to avoid gaps
+  return array_values($items);
+}, 10, 2);
