@@ -47,6 +47,9 @@ final class MTX_Elementor_MemberPress_Visibility {
   /** @var bool Track if the current request contains restricted elements */
   private static $has_restricted_elements = false;
 
+  /** @var array<string,string> Marker comments to output in Elementor editor/preview */
+  private static $editor_marker_comments = [];
+
   /**
    * Get singleton instance
    *
@@ -93,6 +96,9 @@ final class MTX_Elementor_MemberPress_Visibility {
     add_filter( 'elementor/frontend/column/should_render',    [ $this, 'should_render' ], 10, 2 );
     // Container (Flexbox) newer filter
     add_filter( 'elementor/frontend/container/should_render', [ $this, 'should_render' ], 10, 2 );
+
+    // Output editor markers before rendering gated elements
+    add_action( 'elementor/frontend/element/before_render', [ $this, 'maybe_output_editor_marker' ], 5, 1 );
 
     // Disable Elementor cache when restricted elements exist
     add_filter( 'elementor/frontend/should_load_cache', [ $this, 'maybe_disable_elementor_cache' ], 10, 2 );
@@ -223,45 +229,334 @@ final class MTX_Elementor_MemberPress_Visibility {
       return [];
     }
 
-    $candidate_ids = [];
+    $subscriptions = $this->get_user_subscriptions_for_user( $user );
 
-    if ( method_exists( $user, 'active_product_subscriptions' ) ) {
-      try {
-        $candidate_ids = $this->normalize_plan_ids_from_subscriptions( $user->active_product_subscriptions() );
-      } catch ( \Throwable $e ) {
-        $candidate_ids = [];
+    $candidate_ids = [];
+    foreach ( $subscriptions as $subscription ) {
+      $plan_id = $this->get_subscription_product_id( $subscription );
+      if ( $plan_id > 0 ) {
+        $candidate_ids[] = $plan_id;
       }
+    }
+
+    if ( empty( $candidate_ids ) ) {
+      $candidate_ids = $this->get_all_plan_ids();
     }
 
     $candidate_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $candidate_ids ) ) ) );
+    $active_ids    = [];
 
-    $active_ids = [];
-
-    if ( method_exists( $user, 'is_active_member' ) ) {
-      $ids_to_check = ! empty( $candidate_ids ) ? $candidate_ids : $this->get_all_plan_ids();
-
-      foreach ( $ids_to_check as $plan_id ) {
-        $plan_id = absint( $plan_id );
-        if ( $plan_id <= 0 ) {
-          continue;
-        }
-
-        try {
-          if ( $user->is_active_member( $plan_id ) ) {
-            $active_ids[] = $plan_id;
-          }
-        } catch ( \Throwable $e ) {
-          // Ignore individual membership check failures and continue.
+    if ( ! empty( $candidate_ids ) ) {
+      foreach ( $candidate_ids as $plan_id ) {
+        if ( $this->user_has_access_to_plan( $user, $plan_id, $subscriptions ) ) {
+          $active_ids[] = $plan_id;
         }
       }
-    } else {
-      $active_ids = $candidate_ids;
     }
 
-    $active_ids = array_values( array_unique( array_filter( array_map( 'absint', $active_ids ) ) ) );
+    $active_ids = array_values( array_unique( $active_ids ) );
     self::$member_cache[ $cache_key ] = $active_ids;
 
     return $active_ids;
+  }
+
+  /**
+   * Retrieve subscriptions associated with a MemberPress user.
+   *
+   * @param \MeprUser $user MemberPress user instance.
+   * @return array
+   */
+  private function get_user_subscriptions_for_user( $user ) {
+    if ( ! is_object( $user ) ) {
+      return [];
+    }
+
+    $subscriptions = [];
+    $sources = [ 'subscriptions', 'product_subscriptions', 'active_product_subscriptions' ];
+
+    foreach ( $sources as $method ) {
+      if ( ! method_exists( $user, $method ) ) {
+        continue;
+      }
+
+      try {
+        $result = $user->{$method}();
+        $subscriptions = array_merge( $subscriptions, $this->normalize_subscription_collection( $result ) );
+      } catch ( \Throwable $e ) {
+        // Ignore errors from individual MemberPress methods.
+      }
+    }
+
+    return $subscriptions;
+  }
+
+  /**
+   * Normalize various subscription collection formats to an array.
+   *
+   * @param mixed $subscriptions Subscription collection.
+   * @return array
+   */
+  private function normalize_subscription_collection( $subscriptions ) {
+    if ( empty( $subscriptions ) ) {
+      return [];
+    }
+
+    if ( $subscriptions instanceof \Traversable ) {
+      $subscriptions = iterator_to_array( $subscriptions );
+    } elseif ( is_object( $subscriptions ) && method_exists( $subscriptions, 'to_array' ) ) {
+      $subscriptions = $subscriptions->to_array();
+    } elseif ( is_object( $subscriptions ) && isset( $subscriptions->subscriptions ) && is_array( $subscriptions->subscriptions ) ) {
+      $subscriptions = $subscriptions->subscriptions;
+    }
+
+    if ( ! is_array( $subscriptions ) ) {
+      return [];
+    }
+
+    $normalized = [];
+    foreach ( $subscriptions as $subscription ) {
+      if ( null === $subscription ) {
+        continue;
+      }
+
+      if ( class_exists( '\\MeprSubscription' ) && is_numeric( $subscription ) && (int) $subscription > 0 ) {
+        try {
+          $normalized[] = new \MeprSubscription( (int) $subscription );
+          continue;
+        } catch ( \Throwable $e ) {
+          continue;
+        }
+      }
+
+      $normalized[] = $subscription;
+    }
+
+    return $normalized;
+  }
+
+  /**
+   * Extract the MemberPress product ID from a subscription record.
+   *
+   * @param mixed $subscription Subscription entry.
+   * @return int
+   */
+  private function get_subscription_product_id( $subscription ) {
+    if ( is_object( $subscription ) && isset( $subscription->product_id ) ) {
+      return absint( $subscription->product_id );
+    }
+
+    if ( is_object( $subscription ) ) {
+      foreach ( [ 'product_id', 'get_product_id' ] as $method ) {
+        if ( method_exists( $subscription, $method ) ) {
+          try {
+            return absint( $subscription->{$method}() );
+          } catch ( \Throwable $e ) {
+            // Ignore and continue.
+          }
+        }
+      }
+    }
+
+    if ( is_array( $subscription ) && isset( $subscription['product_id'] ) ) {
+      return absint( $subscription['product_id'] );
+    }
+
+    return 0;
+  }
+
+  /**
+   * Determine whether the user has access to a given plan.
+   *
+   * @param \MeprUser $user          MemberPress user.
+   * @param int        $plan_id       Plan/Product ID.
+   * @param array|null $subscriptions Optional subscriptions array for reuse.
+   * @return bool
+   */
+  private function user_has_access_to_plan( $user, $plan_id, $subscriptions = null ) {
+    $plan_id = absint( $plan_id );
+    if ( $plan_id <= 0 || ! is_object( $user ) ) {
+      return false;
+    }
+
+    if ( method_exists( $user, 'has_access_to' ) ) {
+      try {
+        if ( $user->has_access_to( $plan_id ) ) {
+          return true;
+        }
+      } catch ( \Throwable $e ) {
+        // Ignore and fall back to subscription checks.
+      }
+    }
+
+    if ( null === $subscriptions ) {
+      $subscriptions = $this->get_user_subscriptions_for_user( $user );
+    }
+
+    foreach ( (array) $subscriptions as $subscription ) {
+      if ( $this->get_subscription_product_id( $subscription ) !== $plan_id ) {
+        continue;
+      }
+
+      if ( $this->subscription_grants_access( $subscription ) ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Evaluate whether a subscription currently grants access.
+   *
+   * @param mixed $subscription Subscription entry.
+   * @return bool
+   */
+  private function subscription_grants_access( $subscription ) {
+    $status = strtolower( (string) $this->get_subscription_status( $subscription ) );
+
+    if ( in_array( $status, [ 'active', 'trial', 'trialing', 'complete', 'completed', 'confirmed' ], true ) ) {
+      return true;
+    }
+
+    if ( false !== strpos( $status, 'cancel' ) ) {
+      $paid_through = $this->get_subscription_paid_through_timestamp( $subscription );
+      if ( $paid_through > 0 ) {
+        return current_time( 'timestamp' ) <= $paid_through;
+      }
+      return false;
+    }
+
+    if ( '' === $status && is_object( $subscription ) && method_exists( $subscription, 'is_active' ) ) {
+      try {
+        if ( $subscription->is_active() ) {
+          return true;
+        }
+      } catch ( \Throwable $e ) {
+        // Ignore method failures.
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Retrieve the status string from a subscription entry.
+   *
+   * @param mixed $subscription Subscription entry.
+   * @return string
+   */
+  private function get_subscription_status( $subscription ) {
+    if ( is_object( $subscription ) && isset( $subscription->status ) ) {
+      return (string) $subscription->status;
+    }
+
+    if ( is_object( $subscription ) ) {
+      foreach ( [ 'status', 'get_status' ] as $method ) {
+        if ( method_exists( $subscription, $method ) ) {
+          try {
+            return (string) $subscription->{$method}();
+          } catch ( \Throwable $e ) {
+            // Ignore and continue.
+          }
+        }
+      }
+    }
+
+    if ( is_array( $subscription ) && isset( $subscription['status'] ) ) {
+      return (string) $subscription['status'];
+    }
+
+    return '';
+  }
+
+  /**
+   * Determine the paid-through timestamp for a subscription.
+   *
+   * @param mixed $subscription Subscription entry.
+   * @return int Timestamp when access expires.
+   */
+  private function get_subscription_paid_through_timestamp( $subscription ) {
+    $candidates = [];
+
+    if ( is_object( $subscription ) ) {
+      foreach ( [ 'get_paid_through', 'get_paid_thru', 'get_expires_at', 'get_expires_at_gmt' ] as $method ) {
+        if ( method_exists( $subscription, $method ) ) {
+          try {
+            $candidates[] = $subscription->{$method}();
+          } catch ( \Throwable $e ) {
+            // Ignore individual method failures.
+          }
+        }
+      }
+    }
+
+    $properties = [ 'paid_through', 'paid_thru', 'paidthrough', 'expires_at', 'expire_at', 'expires_on', 'expires', 'expiration_date', 'expires_at_gmt' ];
+
+    foreach ( $properties as $property ) {
+      if ( is_object( $subscription ) && isset( $subscription->{$property} ) ) {
+        $candidates[] = $subscription->{$property};
+      } elseif ( is_array( $subscription ) && isset( $subscription[ $property ] ) ) {
+        $candidates[] = $subscription[ $property ];
+      }
+    }
+
+    $timestamp = 0;
+    foreach ( $candidates as $candidate ) {
+      $candidate_ts = $this->normalize_timestamp_value( $candidate );
+      if ( $candidate_ts > $timestamp ) {
+        $timestamp = $candidate_ts;
+      }
+    }
+
+    return $timestamp;
+  }
+
+  /**
+   * Normalize a potential timestamp value returned by MemberPress.
+   *
+   * @param mixed $value Raw value.
+   * @return int
+   */
+  private function normalize_timestamp_value( $value ) {
+    if ( $value instanceof \DateTimeInterface ) {
+      return (int) $value->getTimestamp();
+    }
+
+    if ( is_object( $value ) && method_exists( $value, 'format' ) ) {
+      try {
+        $formatted = $value->format( 'U' );
+        if ( is_numeric( $formatted ) ) {
+          return (int) $formatted;
+        }
+      } catch ( \Throwable $e ) {
+        // Ignore format failures.
+      }
+    }
+
+    if ( is_numeric( $value ) ) {
+      $int_value = (int) $value;
+      if ( $int_value > 0 ) {
+        return $int_value;
+      }
+    }
+
+    if ( is_string( $value ) ) {
+      $value = trim( $value );
+      if ( '' === $value ) {
+        return 0;
+      }
+
+      if ( '0000-00-00 00:00:00' === $value || '0000-00-00' === $value ) {
+        return PHP_INT_MAX;
+      }
+
+      $timestamp = strtotime( $value );
+      if ( $timestamp && $timestamp > 0 ) {
+        return $timestamp;
+      }
+    }
+
+    return 0;
   }
 
   /**
@@ -347,59 +642,211 @@ final class MTX_Elementor_MemberPress_Visibility {
    * @return bool Final render decision
    */
   public function should_render( $should_render, $element ) {
-    try {
-      // Always show in editor so you can work
-      if ( isset( \Elementor\Plugin::$instance->editor ) &&
-           is_object( \Elementor\Plugin::$instance->editor ) &&
-           \Elementor\Plugin::$instance->editor->is_edit_mode() ) {
-        return true;
-      }
-      
-      if ( ! $this->is_plugin_ready() ) {
-        return $should_render;
-      }
-
-      // Get element settings
-      $settings = $element->get_settings_for_display();
-      
-      // Check if MemberPress restriction is enabled
-      if ( ! $this->parse_boolean_setting( $settings['mtx_mepr_enable'] ?? '' ) ) {
-        return $should_render;
-      }
-
-      self::$has_restricted_elements = true;
-      $this->mark_document_as_restricted( $element );
-      $this->send_nocache_headers();
-
-      // Parse and validate visibility settings
-      $invert = $this->parse_boolean_setting( $settings['mtx_mepr_invert'] ?? '' );
-      $require = $this->parse_require_setting( $settings['mtx_mepr_require'] ?? '' );
-
-      // Parse membership IDs from settings with proper validation
-      $ids = [];
-      if ( ! empty( $settings['mtx_mepr_ids'] ) && is_string( $settings['mtx_mepr_ids'] ) ) {
-        $raw_ids = array_map( 'trim', explode( ',', $settings['mtx_mepr_ids'] ) );
-        $ids = array_filter( array_map( 'absint', $raw_ids ), function( $id ) {
-          return $id > 0; // Only allow positive integers
-        } );
-      }
-
-      // Check user authorization
-      $authorized = $this->user_is_authorized( get_current_user_id(), $ids, $require );
-
-      // Apply inversion logic: invert means "show to NOT authorized"
-      $display = $invert ? ! $authorized : $authorized;
-
-
-      return $should_render && $display;
-
-    } catch ( \Throwable $e ) {
-      // Log error only in debug mode to avoid cluttering production logs
-      if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-        error_log( 'MTX Visibility Error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() );
-      }
-      return $should_render; // fail open - show content if there's an error
+    if ( ! $should_render ) {
+      return false;
     }
+
+    try {
+      $settings = ( is_object( $element ) && method_exists( $element, 'get_settings_for_display' ) )
+        ? (array) $element->get_settings_for_display()
+        : [];
+    } catch ( \Throwable $e ) {
+      if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+        error_log( 'MTX Visibility Error: Failed to read element settings - ' . $e->getMessage() );
+      }
+      return false;
+    }
+
+    if ( ! $this->parse_boolean_setting( $settings['mtx_mepr_enable'] ?? '' ) ) {
+      return $should_render;
+    }
+
+    $invert  = $this->parse_boolean_setting( $settings['mtx_mepr_invert'] ?? '' );
+    $require = $this->parse_require_setting( $settings['mtx_mepr_require'] ?? '' );
+
+    $ids = [];
+    if ( ! empty( $settings['mtx_mepr_ids'] ) ) {
+      if ( is_string( $settings['mtx_mepr_ids'] ) ) {
+        $raw_ids = array_map( 'trim', explode( ',', $settings['mtx_mepr_ids'] ) );
+      } elseif ( is_array( $settings['mtx_mepr_ids'] ) ) {
+        $raw_ids = $settings['mtx_mepr_ids'];
+      } else {
+        $raw_ids = [];
+      }
+
+      foreach ( $raw_ids as $raw_id ) {
+        $id = absint( $raw_id );
+        if ( $id > 0 ) {
+          $ids[] = $id;
+        }
+      }
+    }
+
+    self::$has_restricted_elements = true;
+    $this->mark_document_as_restricted( $element );
+    $this->send_nocache_headers();
+
+    if ( $this->is_elementor_edit_or_preview() ) {
+      $this->schedule_editor_marker( $element, $this->build_editor_marker_message( $invert, $ids ) );
+      return true;
+    }
+
+    if ( ! $this->is_plugin_ready() ) {
+      return $invert ? $should_render : false;
+    }
+
+    $authorized = false;
+
+    try {
+      $authorized = $this->user_is_authorized( get_current_user_id(), $ids, $require );
+    } catch ( \Throwable $e ) {
+      if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+        error_log( 'MTX Visibility Error: Authorization check failed - ' . $e->getMessage() );
+      }
+      $authorized = false;
+    }
+
+    $display = $invert ? ! $authorized : $authorized;
+
+    return $display ? $should_render : false;
+  }
+
+  /**
+   * Determine if Elementor is currently in edit or preview mode.
+   *
+   * @return bool
+   */
+  private function is_elementor_edit_or_preview() {
+    if ( ! class_exists( '\\Elementor\\Plugin' ) ) {
+      return false;
+    }
+
+    $plugin = \Elementor\Plugin::$instance;
+
+    if ( isset( $plugin->editor ) && is_object( $plugin->editor ) && method_exists( $plugin->editor, 'is_edit_mode' ) ) {
+      try {
+        if ( $plugin->editor->is_edit_mode() ) {
+          return true;
+        }
+      } catch ( \Throwable $e ) {
+        // Ignore editor detection errors.
+      }
+    }
+
+    if ( isset( $plugin->preview ) && is_object( $plugin->preview ) && method_exists( $plugin->preview, 'is_preview_mode' ) ) {
+      try {
+        if ( $plugin->preview->is_preview_mode() ) {
+          return true;
+        }
+      } catch ( \Throwable $e ) {
+        // Ignore preview detection errors.
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Build the editor marker message used in Elementor edit/preview modes.
+   *
+   * @param bool  $invert Whether invert (non-member view) is enabled.
+   * @param array $ids    Plan IDs associated with the element.
+   * @return string
+   */
+  private function build_editor_marker_message( $invert, array $ids ) {
+    $label = $invert
+      ? 'MTX Visibility: Non-member preview (invert enabled)'
+      : 'MTX Visibility: Members-only preview';
+
+    if ( ! empty( $ids ) ) {
+      $label .= ' | Plans: ' . implode( ', ', array_map( 'intval', $ids ) );
+    } else {
+      $label .= ' | Any active membership';
+    }
+
+    return $label;
+  }
+
+  /**
+   * Schedule an editor marker comment for a specific Elementor element.
+   *
+   * @param \Elementor\Element_Base $element Element instance.
+   * @param string                   $message Comment message.
+   * @return void
+   */
+  private function schedule_editor_marker( $element, $message ) {
+    if ( empty( $message ) ) {
+      return;
+    }
+
+    $element_id = $this->get_element_unique_id( $element );
+    if ( empty( $element_id ) ) {
+      return;
+    }
+
+    self::$editor_marker_comments[ $element_id ] = $message;
+  }
+
+  /**
+   * Output editor marker comments before rendering gated elements.
+   *
+   * @param \Elementor\Element_Base $element Element instance.
+   * @return void
+   */
+  public function maybe_output_editor_marker( $element ) {
+    if ( empty( self::$editor_marker_comments ) || ! $this->is_elementor_edit_or_preview() ) {
+      if ( ! $this->is_elementor_edit_or_preview() ) {
+        self::$editor_marker_comments = [];
+      }
+      return;
+    }
+
+    $element_id = $this->get_element_unique_id( $element );
+    if ( empty( $element_id ) || ! isset( self::$editor_marker_comments[ $element_id ] ) ) {
+      return;
+    }
+
+    echo "\n<!-- " . esc_html( self::$editor_marker_comments[ $element_id ] ) . " -->\n";
+    unset( self::$editor_marker_comments[ $element_id ] );
+  }
+
+  /**
+   * Retrieve a stable identifier for an Elementor element.
+   *
+   * @param \Elementor\Element_Base $element Element instance.
+   * @return string
+   */
+  private function get_element_unique_id( $element ) {
+    if ( ! is_object( $element ) ) {
+      return '';
+    }
+
+    if ( method_exists( $element, 'get_id' ) ) {
+      $id = $element->get_id();
+      if ( ! empty( $id ) ) {
+        return (string) $id;
+      }
+    }
+
+    if ( method_exists( $element, 'get_unique_id' ) ) {
+      $id = $element->get_unique_id();
+      if ( ! empty( $id ) ) {
+        return (string) $id;
+      }
+    }
+
+    if ( isset( $element->id ) && ! empty( $element->id ) ) {
+      return (string) $element->id;
+    }
+
+    if ( method_exists( $element, 'get_unique_name' ) ) {
+      $id = $element->get_unique_name();
+      if ( ! empty( $id ) ) {
+        return (string) $id;
+      }
+    }
+
+    return '';
   }
 
   /**
@@ -484,7 +931,15 @@ final class MTX_Elementor_MemberPress_Visibility {
       return;
     }
 
-    if ( function_exists( 'nocache_headers' ) && ! headers_sent() ) {
+    if ( headers_sent() ) {
+      self::$nocache_headers_sent = true;
+      return;
+    }
+
+    // Ensure caches vary by authentication state when restricted content exists.
+    header( 'Vary: Cookie', false );
+
+    if ( is_user_logged_in() && function_exists( 'nocache_headers' ) ) {
       nocache_headers();
     }
 
