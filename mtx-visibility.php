@@ -22,7 +22,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * MTX Elementor MemberPress Visibility Plugin
  * 
  * Provides per-element visibility control in Elementor based on MemberPress membership status.
- * Features include membership-based show/hide, inversion logic, and efficient caching.
+ * Features include membership-based show/hide, inversion logic, and cache-safe rendering.
  * 
  * @package MTX_Visibility
  * @version 1.0.4
@@ -34,15 +34,18 @@ final class MTX_Elementor_MemberPress_Visibility {
   
   /** @var array|null Cached MemberPress product IDs */
   private static $plan_ids_cache = null;
-  
-  /** @var array User authorization cache with TTL */
+
+  /** @var array<int,bool> Map of Elementor documents that include visibility rules */
+  private static $document_visibility_map = [];
+
+  /** @var array Legacy member cache placeholder (no longer used for caching) */
   private static $member_cache = [];
-  
-  /** @var int Maximum cache entries before cleanup */
-  private static $cache_max_size = 100;
-  
-  /** @var int Cache TTL in seconds (5 minutes) */
-  private static $cache_ttl = 300;
+
+  /** @var bool Flag to avoid re-sending nocache headers */
+  private static $nocache_headers_sent = false;
+
+  /** @var bool Track if the current request contains restricted elements */
+  private static $has_restricted_elements = false;
 
   /**
    * Get singleton instance
@@ -90,6 +93,10 @@ final class MTX_Elementor_MemberPress_Visibility {
     add_filter( 'elementor/frontend/column/should_render',    [ $this, 'should_render' ], 10, 2 );
     // Container (Flexbox) newer filter
     add_filter( 'elementor/frontend/container/should_render', [ $this, 'should_render' ], 10, 2 );
+
+    // Disable Elementor cache when restricted elements exist
+    add_filter( 'elementor/frontend/should_load_cache', [ $this, 'maybe_disable_elementor_cache' ], 10, 2 );
+    add_filter( 'elementor/frontend/should_save_cache', [ $this, 'maybe_disable_elementor_cache' ], 10, 2 );
     
     // Add cache invalidation hooks only if MemberPress is ready
     if ( $this->is_plugin_ready() ) {
@@ -233,7 +240,9 @@ final class MTX_Elementor_MemberPress_Visibility {
   public function should_render( $should_render, $element ) {
     try {
       // Always show in editor so you can work
-      if ( method_exists( \Elementor\Plugin::$instance, 'editor' ) && \Elementor\Plugin::$instance->editor->is_edit_mode() ) {
+      if ( isset( \Elementor\Plugin::$instance->editor ) &&
+           is_object( \Elementor\Plugin::$instance->editor ) &&
+           \Elementor\Plugin::$instance->editor->is_edit_mode() ) {
         return true;
       }
       
@@ -248,6 +257,10 @@ final class MTX_Elementor_MemberPress_Visibility {
       if ( ! $this->parse_boolean_setting( $settings['mtx_mepr_enable'] ?? '' ) ) {
         return $should_render;
       }
+
+      self::$has_restricted_elements = true;
+      $this->mark_document_as_restricted( $element );
+      $this->send_nocache_headers();
 
       // Parse and validate visibility settings
       $invert = $this->parse_boolean_setting( $settings['mtx_mepr_invert'] ?? '' );
@@ -281,6 +294,179 @@ final class MTX_Elementor_MemberPress_Visibility {
   }
 
   /**
+   * Mark the current Elementor document as containing restricted content.
+   *
+   * @param \Elementor\Element_Base $element Elementor element instance
+   * @return void
+   */
+  private function mark_document_as_restricted( $element ) {
+    $doc_id = null;
+
+    if ( is_object( $element ) ) {
+      if ( method_exists( $element, 'get_document' ) ) {
+        $document = $element->get_document();
+        if ( $document && is_object( $document ) ) {
+          if ( method_exists( $document, 'get_main_id' ) ) {
+            $doc_id = $document->get_main_id();
+          } elseif ( method_exists( $document, 'get_id' ) ) {
+            $doc_id = $document->get_id();
+          }
+        }
+      }
+
+      if ( null === $doc_id && method_exists( $element, 'get_main_id' ) ) {
+        $doc_id = $element->get_main_id();
+      }
+
+      if ( null === $doc_id && method_exists( $element, 'get_id' ) ) {
+        $doc_id = $element->get_id();
+      }
+    }
+
+    if ( null === $doc_id && function_exists( 'get_the_ID' ) ) {
+      $doc_id = get_the_ID();
+    }
+
+    $doc_id = absint( $doc_id );
+    if ( $doc_id > 0 ) {
+      self::$document_visibility_map[ $doc_id ] = true;
+    }
+  }
+
+  /**
+   * Disable Elementor caching for documents that include restricted elements.
+   *
+   * @param bool $should_cache Whether Elementor plans to cache the document output.
+   * @param int|null $post_id Document/post ID being cached.
+   * @return bool
+   */
+  public function maybe_disable_elementor_cache( $should_cache, $post_id = null ) {
+    if ( ! $should_cache ) {
+      return $should_cache;
+    }
+
+    if ( self::$has_restricted_elements ) {
+      $this->send_nocache_headers();
+      return false;
+    }
+
+    $post_id = absint( $post_id );
+    if ( $post_id <= 0 && function_exists( 'get_the_ID' ) ) {
+      $post_id = absint( get_the_ID() );
+    }
+    if ( $post_id <= 0 && function_exists( 'get_queried_object_id' ) ) {
+      $post_id = absint( get_queried_object_id() );
+    }
+
+    if ( $post_id > 0 && $this->document_has_visibility_rules( $post_id ) ) {
+      self::$has_restricted_elements = true;
+      $this->send_nocache_headers();
+      return false;
+    }
+
+    return $should_cache;
+  }
+
+  /**
+   * Ensure responses with restricted content are not cached by proxies or browsers.
+   */
+  private function send_nocache_headers() {
+    if ( self::$nocache_headers_sent ) {
+      return;
+    }
+
+    if ( function_exists( 'nocache_headers' ) && ! headers_sent() ) {
+      nocache_headers();
+    }
+
+    self::$nocache_headers_sent = true;
+  }
+
+  /**
+   * Determine whether an Elementor document contains MTX visibility rules.
+   *
+   * @param int $post_id Document/post ID.
+   * @return bool
+   */
+  private function document_has_visibility_rules( $post_id ) {
+    $post_id = absint( $post_id );
+    if ( $post_id <= 0 ) {
+      return false;
+    }
+
+    if ( array_key_exists( $post_id, self::$document_visibility_map ) ) {
+      return (bool) self::$document_visibility_map[ $post_id ];
+    }
+
+    // Prevent recursive loops by setting a default before inspection.
+    self::$document_visibility_map[ $post_id ] = false;
+
+    $has_rules = false;
+
+    if ( class_exists( '\\Elementor\\Plugin' ) ) {
+      $documents = isset( \Elementor\Plugin::$instance->documents ) ? \Elementor\Plugin::$instance->documents : null;
+      if ( $documents && method_exists( $documents, 'get' ) ) {
+        $document = $documents->get( $post_id );
+        if ( $document && is_object( $document ) && method_exists( $document, 'get_elements_data' ) ) {
+          $elements = $document->get_elements_data();
+          if ( is_array( $elements ) ) {
+            $has_rules = $this->elements_have_visibility_rules( $elements );
+          }
+        }
+      }
+    }
+
+    if ( ! $has_rules ) {
+      $raw_data = get_post_meta( $post_id, '_elementor_data', true );
+      if ( is_string( $raw_data ) && $raw_data !== '' ) {
+        $decoded = json_decode( $raw_data, true );
+        if ( is_array( $decoded ) ) {
+          $has_rules = $this->elements_have_visibility_rules( $decoded );
+        }
+      }
+    }
+
+    self::$document_visibility_map[ $post_id ] = $has_rules;
+    return $has_rules;
+  }
+
+  /**
+   * Recursively inspect Elementor element data for MTX visibility rules.
+   *
+   * @param array $elements Elementor element definitions.
+   * @return bool
+   */
+  private function elements_have_visibility_rules( $elements ) {
+    if ( empty( $elements ) || ! is_array( $elements ) ) {
+      return false;
+    }
+
+    foreach ( $elements as $element ) {
+      if ( ! is_array( $element ) ) {
+        continue;
+      }
+
+      $settings = isset( $element['settings'] ) && is_array( $element['settings'] ) ? $element['settings'] : [];
+      if ( $this->parse_boolean_setting( $settings['mtx_mepr_enable'] ?? '' ) ) {
+        return true;
+      }
+
+      if ( ! empty( $element['template_id'] ) ) {
+        $template_id = absint( $element['template_id'] );
+        if ( $template_id > 0 && $this->document_has_visibility_rules( $template_id ) ) {
+          return true;
+        }
+      }
+
+      if ( ! empty( $element['elements'] ) && $this->elements_have_visibility_rules( $element['elements'] ) ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * Check if user is authorized based on membership
    *
    * @param int $user_id
@@ -299,33 +485,15 @@ final class MTX_Elementor_MemberPress_Visibility {
       $require = 'any'; // Default to 'any' if invalid
     }
 
-    $cache_key = $user_id . '|' . implode( ',', (array) $ids ) . '|' . $require;
-    
-    // Check cache with TTL
-    if ( isset( self::$member_cache[$cache_key] ) ) {
-      $cached = self::$member_cache[$cache_key];
-      if ( isset( $cached['timestamp'] ) && ( time() - $cached['timestamp'] ) < self::$cache_ttl ) {
-        return $cached['result'];
-      }
-      unset( self::$member_cache[$cache_key] );
-    }
-    
-    // Manage cache size
-    if ( count( self::$member_cache ) >= self::$cache_max_size ) {
-      self::$member_cache = array_slice( self::$member_cache, -50, null, true );
-    }
-
     try {
       $user = new \MeprUser( $user_id );
-      
+
       // Validate user object
       if ( ! $user || ! is_object( $user ) ) {
-        self::$member_cache[$cache_key] = [ 'result' => false, 'timestamp' => time() ];
         return false;
       }
     } catch ( \Exception $e ) {
       // If we can't create the user object, they're not authorized
-      self::$member_cache[$cache_key] = [ 'result' => false, 'timestamp' => time() ];
       return false;
     }
 
@@ -380,9 +548,7 @@ final class MTX_Elementor_MemberPress_Visibility {
 
     // If no IDs specified: "any active membership?"
     if ( empty( $ids ) ) {
-      $ok = ! empty( $active_ids );
-      self::$member_cache[$cache_key] = [ 'result' => $ok, 'timestamp' => time() ];
-      return $ok;
+      return ! empty( $active_ids );
     }
 
     // With specific IDs: set comparison against active_ids
@@ -391,7 +557,6 @@ final class MTX_Elementor_MemberPress_Visibility {
       $ok = ( $require === 'all' )
         ? empty( array_diff( $ids, $active_ids ) )       // must have ALL IDs
         : ( count( array_intersect( $ids, $active_ids ) ) > 0 ); // ANY overlap
-      self::$member_cache[$cache_key] = [ 'result' => $ok, 'timestamp' => time() ];
       return $ok;
     }
 
@@ -402,9 +567,7 @@ final class MTX_Elementor_MemberPress_Visibility {
                 ? $user->is_active_member( (int) $pid )
                 : false );
     }
-    $ok = ( $require === 'all' ) ? ! in_array( false, $checks, true ) : in_array( true, $checks, true );
-    self::$member_cache[$cache_key] = [ 'result' => $ok, 'timestamp' => time() ];
-    return $ok;
+    return ( $require === 'all' ) ? ! in_array( false, $checks, true ) : in_array( true, $checks, true );
   }
 
   /**
@@ -555,10 +718,9 @@ final class MTX_Elementor_MemberPress_Visibility {
   public static function get_cache_stats() {
     return [
       'member_cache_size' => count( self::$member_cache ),
-      'member_cache_max' => self::$cache_max_size,
+      'member_cache_enabled' => false,
       'plan_cache_cached' => self::$plan_ids_cache !== null,
       'plan_cache_size' => self::$plan_ids_cache ? count( self::$plan_ids_cache ) : 0,
-      'cache_ttl' => self::$cache_ttl,
     ];
   }
   
