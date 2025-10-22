@@ -156,6 +156,115 @@ final class MTX_Elementor_MemberPress_Visibility {
   }
 
   /**
+   * Normalize plan IDs from MemberPress subscription objects or arrays.
+   *
+   * @param mixed $active_subs Subscriptions returned by MemberPress.
+   * @return array<int>
+   */
+  private function normalize_plan_ids_from_subscriptions( $active_subs ) {
+    if ( empty( $active_subs ) || ! is_array( $active_subs ) ) {
+      return [];
+    }
+
+    $ids = [];
+    $subscription_class_exists = class_exists( '\\MeprSubscription' );
+
+    foreach ( $active_subs as $sub ) {
+      if ( $subscription_class_exists && $sub instanceof \MeprSubscription ) {
+        if ( ! empty( $sub->product_id ) ) {
+          $ids[] = (int) $sub->product_id;
+        }
+        continue;
+      }
+
+      if ( is_object( $sub ) && isset( $sub->product_id ) ) {
+        $ids[] = (int) $sub->product_id;
+        continue;
+      }
+
+      if ( is_array( $sub ) && isset( $sub['product_id'] ) ) {
+        $ids[] = (int) $sub['product_id'];
+        continue;
+      }
+
+      if ( is_numeric( $sub ) ) {
+        $ids[] = (int) $sub;
+      }
+    }
+
+    return $ids;
+  }
+
+  /**
+   * Get active MemberPress plan IDs for a user.
+   *
+   * @param int $user_id
+   * @return array<int>
+   */
+  public function get_active_plan_ids_for_user( $user_id ) {
+    $user_id = absint( $user_id );
+    if ( $user_id <= 0 || ! class_exists( 'MeprUser' ) ) {
+      return [];
+    }
+
+    $cache_key = $user_id . '|active_plans';
+    if ( array_key_exists( $cache_key, self::$member_cache ) ) {
+      return self::$member_cache[ $cache_key ];
+    }
+
+    try {
+      $user = new \MeprUser( $user_id );
+      if ( ! $user || ! is_object( $user ) ) {
+        self::$member_cache[ $cache_key ] = [];
+        return [];
+      }
+    } catch ( \Throwable $e ) {
+      self::$member_cache[ $cache_key ] = [];
+      return [];
+    }
+
+    $candidate_ids = [];
+
+    if ( method_exists( $user, 'active_product_subscriptions' ) ) {
+      try {
+        $candidate_ids = $this->normalize_plan_ids_from_subscriptions( $user->active_product_subscriptions() );
+      } catch ( \Throwable $e ) {
+        $candidate_ids = [];
+      }
+    }
+
+    $candidate_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $candidate_ids ) ) ) );
+
+    $active_ids = [];
+
+    if ( method_exists( $user, 'is_active_member' ) ) {
+      $ids_to_check = ! empty( $candidate_ids ) ? $candidate_ids : $this->get_all_plan_ids();
+
+      foreach ( $ids_to_check as $plan_id ) {
+        $plan_id = absint( $plan_id );
+        if ( $plan_id <= 0 ) {
+          continue;
+        }
+
+        try {
+          if ( $user->is_active_member( $plan_id ) ) {
+            $active_ids[] = $plan_id;
+          }
+        } catch ( \Throwable $e ) {
+          // Ignore individual membership check failures and continue.
+        }
+      }
+    } else {
+      $active_ids = $candidate_ids;
+    }
+
+    $active_ids = array_values( array_unique( array_filter( array_map( 'absint', $active_ids ) ) ) );
+    self::$member_cache[ $cache_key ] = $active_ids;
+
+    return $active_ids;
+  }
+
+  /**
    * Check for required dependencies
    */
   public function check_dependencies() {
@@ -485,66 +594,7 @@ final class MTX_Elementor_MemberPress_Visibility {
       $require = 'any'; // Default to 'any' if invalid
     }
 
-    try {
-      $user = new \MeprUser( $user_id );
-
-      // Validate user object
-      if ( ! $user || ! is_object( $user ) ) {
-        return false;
-      }
-    } catch ( \Exception $e ) {
-      // If we can't create the user object, they're not authorized
-      return false;
-    }
-
-    // Get active product IDs using the most reliable MemberPress method
-    $active_ids = [];
-    
-    // Primary method: active_product_subscriptions — normalize return values to product IDs
-    if ( method_exists( $user, 'active_product_subscriptions' ) ) {
-      try {
-        $active_subs = $user->active_product_subscriptions();
-        $subscription_class_exists = class_exists( '\MeprSubscription' );
-        if ( is_array( $active_subs ) ) {
-          foreach ( $active_subs as $sub ) {
-            if ( $subscription_class_exists && $sub instanceof \MeprSubscription ) {
-              if ( ! empty( $sub->product_id ) ) {
-                $active_ids[] = (int) $sub->product_id;
-              }
-              continue;
-            }
-
-            if ( is_object( $sub ) && isset( $sub->product_id ) ) {
-              $active_ids[] = (int) $sub->product_id;
-              continue;
-            }
-
-            if ( is_array( $sub ) && isset( $sub['product_id'] ) ) {
-              $active_ids[] = (int) $sub['product_id'];
-              continue;
-            }
-
-            if ( is_numeric( $sub ) ) {
-              $active_ids[] = (int) $sub;
-            }
-          }
-        }
-      } catch ( \Exception $e ) {
-        // If the method fails, fall through to fallback
-      }
-    }
-    
-    // Fallback method: is_active_member for each product (for older MemberPress versions)
-    if ( empty( $active_ids ) && method_exists( $user, 'is_active_member' ) ) {
-      $all_plan_ids = $this->get_all_plan_ids();
-      foreach ( $all_plan_ids as $plan_id ) {
-        if ( $user->is_active_member( $plan_id ) ) {
-          $active_ids[] = $plan_id;
-        }
-      }
-    }
-    
-    $active_ids = array_unique( array_filter( array_map( 'absint', $active_ids ) ) );
+    $active_ids = $this->get_active_plan_ids_for_user( (int) $user_id );
 
     // If no IDs specified: "any active membership?"
     if ( empty( $ids ) ) {
@@ -553,21 +603,19 @@ final class MTX_Elementor_MemberPress_Visibility {
 
     // With specific IDs: set comparison against active_ids
     $ids = array_filter( array_map( 'absint', (array) $ids ) );
-    if ( ! empty( $active_ids ) ) {
-      $ok = ( $require === 'all' )
-        ? empty( array_diff( $ids, $active_ids ) )       // must have ALL IDs
-        : ( count( array_intersect( $ids, $active_ids ) ) > 0 ); // ANY overlap
-      return $ok;
+    if ( empty( $ids ) ) {
+      return ! empty( $active_ids );
     }
 
-    // Fallback (older MP): per-ID check
-    $checks = [];
-    foreach ( $ids as $pid ) {
-      $checks[] = (bool) ( method_exists( $user, 'is_active_member' )
-                ? $user->is_active_member( (int) $pid )
-                : false );
+    if ( empty( $active_ids ) ) {
+      return false;
     }
-    return ( $require === 'all' ) ? ! in_array( false, $checks, true ) : in_array( true, $checks, true );
+
+    $ok = ( $require === 'all' )
+      ? empty( array_diff( $ids, $active_ids ) )       // must have ALL IDs
+      : ( count( array_intersect( $ids, $active_ids ) ) > 0 ); // ANY overlap
+
+    return $ok;
   }
 
   /**
@@ -873,58 +921,20 @@ add_filter('wp_nav_menu_objects', function($items, $args) {
 
    // Cache active plan IDs per request
    static $active_plan_ids = null;
-   if ($is_logged_in && class_exists('MeprUser') && $active_plan_ids === null) {
+   if ( ! $is_logged_in ) {
      $active_plan_ids = [];
-     try {
-       $user = new \MeprUser($user_id);
-       
-       // Use the same reliable method as the main plugin
-       if (method_exists($user, 'active_product_subscriptions')) {
-         $active_subs = $user->active_product_subscriptions();
-         $subscription_class_exists = class_exists('\MeprSubscription');
-         if (is_array($active_subs)) {
-           foreach ($active_subs as $sub) {
-             if ($subscription_class_exists && $sub instanceof \MeprSubscription) {
-               if (!empty($sub->product_id)) {
-                 $active_plan_ids[] = (int) $sub->product_id;
-               }
-               continue;
-             }
-
-             if (is_object($sub) && isset($sub->product_id)) {
-               $active_plan_ids[] = (int) $sub->product_id;
-               continue;
-             }
-
-             if (is_array($sub) && isset($sub['product_id'])) {
-               $active_plan_ids[] = (int) $sub['product_id'];
-               continue;
-             }
-
-             if (is_numeric($sub)) {
-               $active_plan_ids[] = (int) $sub;
-             }
-           }
+   } elseif ( $active_plan_ids === null ) {
+     $active_plan_ids = [];
+     if ( class_exists( 'MTX_Elementor_MemberPress_Visibility' ) ) {
+       $visibility = MTX_Elementor_MemberPress_Visibility::instance();
+       if ( $visibility && method_exists( $visibility, 'get_active_plan_ids_for_user' ) ) {
+         try {
+           $active_plan_ids = $visibility->get_active_plan_ids_for_user( $user_id );
+         } catch ( \Throwable $e ) {
+           $active_plan_ids = [];
          }
        }
-       
-       // Fallback method for older MemberPress versions
-       if (empty($active_plan_ids) && method_exists($user, 'is_active_member')) {
-         $all_plan_ids = get_posts([
-           'post_type' => 'memberpressproduct',
-           'post_status' => 'publish',
-           'numberposts' => -1,
-           'fields' => 'ids',
-           'suppress_filters' => false,
-         ]);
-         foreach ($all_plan_ids as $plan_id) {
-           if ($user->is_active_member($plan_id)) {
-             $active_plan_ids[] = $plan_id;
-           }
-         }
-       }
-     } catch (\Throwable $e) { $active_plan_ids = []; }
-     $active_plan_ids = array_unique(array_filter(array_map('absint', $active_plan_ids)));
+     }
    }
 
   foreach ($items as $key => $item) {
@@ -969,17 +979,6 @@ add_filter('wp_nav_menu_objects', function($items, $args) {
             $should_show = $require_all
               ? empty(array_diff($ids, $active_plan_ids))                      // has ALL
               : (count(array_intersect($ids, $active_plan_ids)) > 0);          // has ANY
-          } elseif (class_exists('MeprUser')) {
-            // Fallback per-ID (older MP)
-            $should_show = false;
-            try {
-              $user = new \MeprUser($user_id);
-              $checks = [];
-              foreach ($ids as $pid) {
-                $checks[] = (bool)(method_exists($user,'is_active_member') ? $user->is_active_member((int)$pid) : false);
-              }
-              $should_show = $require_all ? !in_array(false,$checks,true) : in_array(true,$checks,true);
-            } catch (\Throwable $e) { $should_show = false; }
           } else {
             $should_show = false;
           }
