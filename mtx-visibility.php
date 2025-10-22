@@ -115,7 +115,27 @@ final class MTX_Elementor_MemberPress_Visibility {
    * @return bool
    */
   private function parse_boolean_setting( $value ) {
-    return ! empty( $value ) && $value === 'yes';
+    if ( is_bool( $value ) ) {
+      return $value;
+    }
+
+    if ( is_int( $value ) ) {
+      return $value === 1;
+    }
+
+    if ( is_string( $value ) ) {
+      $value = strtolower( trim( $value ) );
+
+      if ( in_array( $value, [ 'yes', 'true', 'on', '1' ], true ) ) {
+        return true;
+      }
+
+      if ( in_array( $value, [ 'no', 'false', 'off', '0' ], true ) ) {
+        return false;
+      }
+    }
+
+    return ! empty( $value );
   }
 
   /**
