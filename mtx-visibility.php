@@ -312,12 +312,34 @@ final class MTX_Elementor_MemberPress_Visibility {
     // Get active product IDs using the most reliable MemberPress method
     $active_ids = [];
     
-    // Primary method: active_product_subscriptions with 'ids' parameter (most reliable)
+    // Primary method: active_product_subscriptions — normalize return values to product IDs
     if ( method_exists( $user, 'active_product_subscriptions' ) ) {
       try {
-        $active_ids_array = $user->active_product_subscriptions( 'ids' );
-        if ( is_array( $active_ids_array ) ) {
-          $active_ids = array_merge( $active_ids, $active_ids_array );
+        $active_subs = $user->active_product_subscriptions();
+        $subscription_class_exists = class_exists( '\MeprSubscription' );
+        if ( is_array( $active_subs ) ) {
+          foreach ( $active_subs as $sub ) {
+            if ( $subscription_class_exists && $sub instanceof \MeprSubscription ) {
+              if ( ! empty( $sub->product_id ) ) {
+                $active_ids[] = (int) $sub->product_id;
+              }
+              continue;
+            }
+
+            if ( is_object( $sub ) && isset( $sub->product_id ) ) {
+              $active_ids[] = (int) $sub->product_id;
+              continue;
+            }
+
+            if ( is_array( $sub ) && isset( $sub['product_id'] ) ) {
+              $active_ids[] = (int) $sub['product_id'];
+              continue;
+            }
+
+            if ( is_numeric( $sub ) ) {
+              $active_ids[] = (int) $sub;
+            }
+          }
         }
       } catch ( \Exception $e ) {
         // If the method fails, fall through to fallback
@@ -442,29 +464,39 @@ final class MTX_Elementor_MemberPress_Visibility {
    * Clear user cache from subscription status change hook
    *
    * @param string $old_status Old subscription status
-   * @param string $new_status New subscription status  
-   * @param int $sub_id Subscription ID
+   * @param string $new_status New subscription status
+   * @param mixed $subscription Subscription object or ID
    */
-  public function clear_user_cache_from_sub( $old_status, $new_status, $sub_id ) {
-    $this->clear_user_cache_from_sub_id( $sub_id );
+  public function clear_user_cache_from_sub( $old_status, $new_status, $subscription ) {
+    $this->clear_user_cache_from_sub_id( $subscription );
   }
-  
+
   /**
    * Clear user cache from subscription ID
    *
-   * @param int $sub_id Subscription ID
+   * @param mixed $sub_id Subscription object or ID
    */
   public function clear_user_cache_from_sub_id( $sub_id ) {
-    if ( ! class_exists( 'MeprSubscription' ) ) {
+    $user_id = null;
+
+    $subscription_class_exists = class_exists( '\MeprSubscription' );
+
+    if ( $subscription_class_exists && $sub_id instanceof \MeprSubscription ) {
+      $user_id = $sub_id->user_id;
+    } elseif ( is_object( $sub_id ) && isset( $sub_id->user_id ) ) {
+      $user_id = $sub_id->user_id;
+    } elseif ( $subscription_class_exists && is_numeric( $sub_id ) && (int) $sub_id > 0 ) {
+      $subscription = new \MeprSubscription( (int) $sub_id );
+      if ( is_object( $subscription ) && isset( $subscription->user_id ) ) {
+        $user_id = $subscription->user_id;
+      }
+    }
+
+    if ( empty( $user_id ) ) {
       return;
     }
-    
-    $sub = new \MeprSubscription( (int) $sub_id );
-    if ( ! is_object( $sub ) || empty( $sub->user_id ) ) {
-      return;
-    }
-    
-    $this->clear_user_cache( (int) $sub->user_id );
+
+    $this->clear_user_cache( (int) $user_id );
   }
   
   /**
@@ -666,9 +698,31 @@ add_filter('wp_nav_menu_objects', function($items, $args) {
        
        // Use the same reliable method as the main plugin
        if (method_exists($user, 'active_product_subscriptions')) {
-         $active_ids_array = $user->active_product_subscriptions('ids');
-         if (is_array($active_ids_array)) {
-           $active_plan_ids = array_merge($active_plan_ids, $active_ids_array);
+         $active_subs = $user->active_product_subscriptions();
+         $subscription_class_exists = class_exists('\MeprSubscription');
+         if (is_array($active_subs)) {
+           foreach ($active_subs as $sub) {
+             if ($subscription_class_exists && $sub instanceof \MeprSubscription) {
+               if (!empty($sub->product_id)) {
+                 $active_plan_ids[] = (int) $sub->product_id;
+               }
+               continue;
+             }
+
+             if (is_object($sub) && isset($sub->product_id)) {
+               $active_plan_ids[] = (int) $sub->product_id;
+               continue;
+             }
+
+             if (is_array($sub) && isset($sub['product_id'])) {
+               $active_plan_ids[] = (int) $sub['product_id'];
+               continue;
+             }
+
+             if (is_numeric($sub)) {
+               $active_plan_ids[] = (int) $sub;
+             }
+           }
          }
        }
        
