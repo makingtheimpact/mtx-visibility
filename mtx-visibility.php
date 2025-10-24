@@ -15,6 +15,11 @@
  * - User Switching 1.10.0
  */
 
+// If true, any malformed/unknown state fails closed (DENY)
+if ( ! defined( 'MTX_VIS_FAIL_CLOSED' ) ) {
+    define( 'MTX_VIS_FAIL_CLOSED', true );
+}
+
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
@@ -127,6 +132,11 @@ class MTX_Visibility_Engine {
 
     public function resolve_visibility( array $settings, int $user_id ): bool {
         $enable = ! empty( $settings['enable'] );
+
+        // If engine is asked to resolve but settings are weird and fail-closed is on, deny.
+        if ( MTX_VIS_FAIL_CLOSED && $enable && ! isset( $settings['require'] ) ) {
+            return false;
+        }
 
         if ( ! $enable ) {
             return true;
@@ -360,6 +370,18 @@ class MTX_Visibility_Elementor {
     /** Track if page has any gated elements and mark it uncachable. */
     private static bool $has_gated_elements = false;
 
+    /** Normalize Elementor switchers: accept 'yes' | '1' | 1 | true */
+    private static function is_switch_on( $val ): bool {
+        return ( $val === 'yes' || $val === '1' || $val === 1 || $val === true );
+    }
+
+    /** Output a small HTML comment for admins so we can see decisions inline */
+    private static function admin_comment( string $text ): void {
+        if ( current_user_can( 'manage_options' ) ) {
+            echo "\n<!-- MTX {$text} -->\n";
+        }
+    }
+
     /** Register header hook to send no-cache headers when gated content detected. */
     private static function ensure_headers_hook(): void {
         static $hooked = false;
@@ -471,13 +493,31 @@ class MTX_Visibility_Elementor {
             ? (array) $element->get_settings_for_display()
             : (array) $element->get_settings();
 
-        $enable = ( isset( $settings['mtx_mepr_enable'] ) && 'yes' === $settings['mtx_mepr_enable'] );
+        $raw_enable  = $settings['mtx_mepr_enable']  ?? '';
+        $raw_invert  = $settings['mtx_mepr_invert']  ?? '';
+        $ids         = $settings['mtx_mepr_ids']     ?? '';
+        $require     = $settings['mtx_mepr_require'] ?? 'any';
+
+        // Normalize switchers robustly
+        $enable = self::is_switch_on( $raw_enable );
+        $invert = self::is_switch_on( $raw_invert );
+
+        // Safety: if IDs are present but enable not explicitly set, auto-enable.
+        if ( ! $enable && is_string( $ids ) && trim( $ids ) !== '' ) {
+            $enable = true;
+        }
+
+        // If visibility is enabled on this element, mark page gated (for no-cache header hook)
         if ( $enable ) {
             self::$has_gated_elements = true;
         }
-        $ids    = $settings['mtx_mepr_ids'] ?? '';
-        $require = $settings['mtx_mepr_require'] ?? 'any';
-        $invert  = ( isset( $settings['mtx_mepr_invert'] ) && 'yes' === $settings['mtx_mepr_invert'] );
+
+        // Fail-closed: if enabled, not inverted, and user is NOT logged in, deny immediately.
+        // (Prevents any chance of a guest seeing a members-only element.)
+        if ( $enable && ! $invert && ! is_user_logged_in() ) {
+            self::admin_comment( 'DENY (guest short-circuit) enable=1 invert=0' );
+            return false;
+        }
 
         $decision = MTX_Visibility_Engine::instance()->resolve_visibility(
             [
@@ -487,6 +527,19 @@ class MTX_Visibility_Elementor {
                 'invert'  => $invert,
             ],
             get_current_user_id()
+        );
+
+        // Admin-only inline marker so you can see the computed decision & inputs
+        self::admin_comment(
+            sprintf(
+                'decision=%s enable=%s ids="%s" require=%s invert=%s user=%d',
+                $decision ? 'ALLOW' : 'DENY',
+                $enable ? '1' : '0',
+                is_string( $ids ) ? $ids : json_encode( $ids ),
+                $require === 'all' ? 'all' : 'any',
+                $invert ? '1' : '0',
+                (int) get_current_user_id()
+            )
         );
 
         return $decision ? $should_render : false;
