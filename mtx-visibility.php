@@ -54,6 +54,36 @@ class MTX_Visibility_Engine {
         return self::boot();
     }
 
+    public function is_authorized( int $user_id, array $required_ids, string $require ): bool {
+        $require = ( strtolower( $require ) === 'all' ) ? 'all' : 'any';
+
+        // Must be logged in and MP available
+        if ( $user_id <= 0 || ! is_user_logged_in() || ! class_exists( '\\MeprUser' ) ) {
+            return false;
+        }
+
+        try {
+            $user = new \MeprUser( $user_id );
+        } catch ( \Throwable $e ) {
+            return false;
+        }
+
+        // If specific Product IDs are provided, check active access to each product.
+        if ( ! empty( $required_ids ) ) {
+            $results = [];
+            foreach ( $required_ids as $product_id ) {
+                $results[] = $this->has_active_access_to_product( $user, (int) $product_id );
+            }
+
+            return ( $require === 'all' )
+                ? ! in_array( false, $results, true )
+                : in_array( true, $results, true );
+        }
+
+        // No IDs provided => treat as "user has any active membership"
+        return $this->user_has_any_active_membership( $user );
+    }
+
     public function get_active_membership_ids( int $user_id ): array {
         if ( $user_id <= 0 || ! class_exists( '\\MeprUser' ) ) {
             return [];
@@ -67,67 +97,32 @@ class MTX_Visibility_Engine {
 
         $ids = [];
 
+        // Prefer MP's "active product subscriptions" when available
         try {
             if ( method_exists( $user, 'active_product_subscriptions' ) ) {
                 $subs = (array) $user->active_product_subscriptions();
-                $ids  = $this->extract_product_ids_from_subscriptions( $subs );
-            }
-
-            if ( empty( $ids ) && method_exists( $user, 'subscriptions' ) ) {
-                $subs = (array) $user->subscriptions();
-                $ids  = $this->extract_product_ids_from_subscriptions( $subs );
-            }
-        } catch ( \Throwable $e ) {
-            return [];
-        }
-
-        return $ids;
-    }
-
-    public function is_authorized( int $user_id, array $required_ids, string $require ): bool {
-        $require = ( strtolower( $require ) === 'all' ) ? 'all' : 'any';
-
-        if ( ! class_exists( '\\MeprUser' ) ) {
-            return false;
-        }
-
-        if ( $user_id <= 0 || ! is_user_logged_in() ) {
-            return false;
-        }
-
-        try {
-            $user = new \MeprUser( $user_id );
-        } catch ( \Throwable $e ) {
-            return false;
-        }
-
-        if ( ! empty( $required_ids ) ) {
-            $results = [];
-
-            foreach ( $required_ids as $product_id ) {
-                $authorized = false;
-
-                if ( method_exists( $user, 'has_access_to' ) ) {
-                    try {
-                        $authorized = (bool) $user->has_access_to( $product_id );
-                    } catch ( \Throwable $e ) {
-                        $authorized = false;
+                foreach ( $subs as $sub ) {
+                    $pid = $this->extract_product_id_from_subscription( $sub );
+                    if ( $pid > 0 ) {
+                        $ids[] = $pid;
                     }
                 }
-
-                $results[] = $authorized;
+            } else if ( method_exists( $user, 'subscriptions' ) ) {
+                $subs = (array) $user->subscriptions();
+                foreach ( $subs as $sub ) {
+                    if ( $this->subscription_is_active_like( $sub ) ) {
+                        $pid = $this->extract_product_id_from_subscription( $sub );
+                        if ( $pid > 0 ) {
+                            $ids[] = $pid;
+                        }
+                    }
+                }
             }
-
-            if ( 'all' === $require ) {
-                return ! in_array( false, $results, true );
-            }
-
-            return in_array( true, $results, true );
+        } catch ( \Throwable $e ) {
+            // ignore and fall through
         }
 
-        $active_ids = $this->get_active_membership_ids( $user_id );
-
-        return ! empty( $active_ids );
+        return array_values( array_unique( $ids ) );
     }
 
     public function resolve_visibility( array $settings, int $user_id ): bool {
@@ -230,6 +225,134 @@ class MTX_Visibility_Engine {
         }
 
         return array_values( array_unique( $ids ) );
+    }
+
+    /** True if user has active (or canceled-but-paid-through) access to this Product ID */
+    private function has_active_access_to_product( \MeprUser $user, int $product_id ): bool {
+        if ( $product_id <= 0 ) return false;
+
+        // Try active subscriptions accessor first
+        try {
+            if ( method_exists( $user, 'active_product_subscriptions' ) ) {
+                $subs = (array) $user->active_product_subscriptions();
+                foreach ( $subs as $sub ) {
+                    if ( $product_id === $this->extract_product_id_from_subscription( $sub ) ) {
+                        // Active list implies active => allow
+                        return true;
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) { /* continue */ }
+
+        // Fallback: full subscriptions list with our own "active-like" check
+        try {
+            if ( method_exists( $user, 'subscriptions' ) ) {
+                $subs = (array) $user->subscriptions();
+                foreach ( $subs as $sub ) {
+                    $pid = $this->extract_product_id_from_subscription( $sub );
+                    if ( $pid === $product_id && $this->subscription_is_active_like( $sub ) ) {
+                        return true;
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) { /* continue */ }
+
+        return false;
+    }
+
+    /** True if user has any active (or canceled-but-paid-through) membership */
+    private function user_has_any_active_membership( \MeprUser $user ): bool {
+        try {
+            if ( method_exists( $user, 'active_product_subscriptions' ) ) {
+                $subs = (array) $user->active_product_subscriptions();
+                if ( ! empty( $subs ) ) return true;
+            }
+            if ( method_exists( $user, 'subscriptions' ) ) {
+                $subs = (array) $user->subscriptions();
+                foreach ( $subs as $sub ) {
+                    if ( $this->subscription_is_active_like( $sub ) ) {
+                        return true;
+                    }
+                }
+            }
+        } catch ( \Throwable $e ) {
+            // conservative default below
+        }
+        return false;
+    }
+
+    /** Normalize "active-enough" status: active OR canceled but paid_through in the future */
+    private function subscription_is_active_like( $sub ): bool {
+        $status = '';
+        $paid_through_ts = 0;
+
+        // Status (property or method)
+        if ( is_object( $sub ) ) {
+            if ( isset( $sub->status ) ) {
+                $status = (string) $sub->status;
+            } elseif ( method_exists( $sub, 'status' ) ) {
+                try { $status = (string) $sub->status(); } catch ( \Throwable $e ) {}
+            }
+        } elseif ( is_array( $sub ) && isset( $sub['status'] ) ) {
+            $status = (string) $sub['status'];
+        }
+
+        // Paid-through / expires (several possible shapes)
+        if ( is_object( $sub ) ) {
+            if ( isset( $sub->paid_through ) ) {
+                $paid_through_ts = is_numeric( $sub->paid_through ) ? (int) $sub->paid_through : strtotime( (string) $sub->paid_through );
+            } elseif ( method_exists( $sub, 'paid_through' ) ) {
+                try { $paid_through_ts = strtotime( (string) $sub->paid_through() ); } catch ( \Throwable $e ) {}
+            } elseif ( isset( $sub->expires_at ) ) {
+                $paid_through_ts = is_numeric( $sub->expires_at ) ? (int) $sub->expires_at : strtotime( (string) $sub->expires_at );
+            }
+        } elseif ( is_array( $sub ) ) {
+            if ( isset( $sub['paid_through'] ) ) {
+                $paid_through_ts = is_numeric( $sub['paid_through'] ) ? (int) $sub['paid_through'] : strtotime( (string) $sub['paid_through'] );
+            } elseif ( isset( $sub['expires_at'] ) ) {
+                $paid_through_ts = is_numeric( $sub['expires_at'] ) ? (int) $sub['expires_at'] : strtotime( (string) $sub['expires_at'] );
+            }
+        }
+
+        $status_lc = strtolower( $status );
+        $now = time();
+
+        $is_active      = ( false !== strpos( $status_lc, 'active' ) );
+        $is_canceled    = ( false !== strpos( $status_lc, 'cancel' ) );
+        $paid_in_future = ( $paid_through_ts > $now );
+
+        return ( $is_active || ( $is_canceled && $paid_in_future ) );
+    }
+
+    /** Best-effort extraction of product_id from a subscription object/array/int */
+    private function extract_product_id_from_subscription( $sub ): int {
+        $pid = null;
+
+        if ( is_object( $sub ) ) {
+            if ( isset( $sub->product_id ) ) {
+                $pid = $sub->product_id;
+            } elseif ( method_exists( $sub, 'product_id' ) ) {
+                try { $pid = $sub->product_id(); } catch ( \Throwable $e ) {}
+            } elseif ( isset( $sub->product ) && is_object( $sub->product ) && isset( $sub->product->ID ) ) {
+                $pid = $sub->product->ID;
+            } elseif ( method_exists( $sub, 'product' ) ) {
+                try {
+                    $product = $sub->product();
+                    if ( is_object( $product ) && isset( $product->ID ) ) $pid = $product->ID;
+                } catch ( \Throwable $e ) {}
+            }
+        } elseif ( is_array( $sub ) ) {
+            if ( isset( $sub['product_id'] ) ) {
+                $pid = $sub['product_id'];
+            } elseif ( isset( $sub['ID'] ) ) {
+                $pid = $sub['ID'];
+            }
+        } elseif ( is_numeric( $sub ) ) {
+            $pid = $sub;
+        }
+
+        $pid = (int) $pid;
+        return ( $pid > 0 ) ? $pid : 0;
     }
 }
 
@@ -458,5 +581,39 @@ class MTX_Visibility_Menus {
         <?php
     }
 }
+
+add_shortcode('mtx_vis_debug', function() {
+    if ( ! is_user_logged_in() ) return '<pre>Not logged in</pre>';
+    if ( ! class_exists('\\MeprUser') ) return '<pre>MemberPress not active</pre>';
+
+    $uid = get_current_user_id();
+    $user = new \MeprUser($uid);
+    $engine = MTX_Visibility_Engine::instance();
+
+    $active_ids = $engine->get_active_membership_ids($uid);
+    $out = [
+        'user_id'     => $uid,
+        'active_ids'  => $active_ids,
+        'timestamp'   => time(),
+    ];
+
+    // Try to dump a few raw subs for sanity.
+    try {
+        if ( method_exists($user, 'subscriptions') ) {
+            $subs = (array) $user->subscriptions();
+            $sample = [];
+            foreach ($subs as $s) {
+                $sample[] = [
+                    'product_id'   => $engine->extract_product_id_from_subscription($s),
+                    'status'       => (is_object($s) && isset($s->status)) ? $s->status : (is_array($s) && isset($s['status']) ? $s['status'] : ''),
+                ];
+                if (count($sample) >= 5) break;
+            }
+            $out['subs_sample'] = $sample;
+        }
+    } catch (\Throwable $e) {}
+
+    return '<pre>'.esc_html(print_r($out, true)).'</pre>';
+});
 
 new MTX_Visibility_Plugin();
