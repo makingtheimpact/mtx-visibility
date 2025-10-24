@@ -357,7 +357,35 @@ class MTX_Visibility_Engine {
 }
 
 class MTX_Visibility_Elementor {
+    /** Track if page has any gated elements and mark it uncachable. */
+    private static bool $has_gated_elements = false;
+
+    /** Register header hook to send no-cache headers when gated content detected. */
+    private static function ensure_headers_hook(): void {
+        static $hooked = false;
+        if ( $hooked ) {
+            return;
+        }
+        $hooked = true;
+
+        add_action( 'send_headers', function() {
+            if ( ! is_admin() && ! defined( 'DOING_AJAX' ) && self::$has_gated_elements ) {
+                if ( ! headers_sent() ) {
+                    nocache_headers();
+                    header( 'Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0' );
+                    header( 'Pragma: no-cache' );
+                    header( 'Vary: Cookie' );
+                    if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+                        define( 'DONOTCACHEPAGE', true );
+                    }
+                }
+            }
+        }, 0 );
+    }
+
     public static function boot(): void {
+        self::ensure_headers_hook();
+
         add_action( 'elementor/element/common/section_advanced/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
         add_action( 'elementor/element/section/section_advanced/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
         add_action( 'elementor/element/column/section_advanced/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
@@ -444,6 +472,9 @@ class MTX_Visibility_Elementor {
             : (array) $element->get_settings();
 
         $enable = ( isset( $settings['mtx_mepr_enable'] ) && 'yes' === $settings['mtx_mepr_enable'] );
+        if ( $enable ) {
+            self::$has_gated_elements = true;
+        }
         $ids    = $settings['mtx_mepr_ids'] ?? '';
         $require = $settings['mtx_mepr_require'] ?? 'any';
         $invert  = ( isset( $settings['mtx_mepr_invert'] ) && 'yes' === $settings['mtx_mepr_invert'] );
@@ -581,6 +612,79 @@ class MTX_Visibility_Menus {
         <?php
     }
 }
+
+// [mtx_nocache] shortcode – use in Elementor templates
+add_shortcode( 'mtx_nocache', function() {
+    if ( ! headers_sent() ) {
+        nocache_headers();
+        header( 'Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0' );
+        header( 'Pragma: no-cache' );
+        header( 'Vary: Cookie' );
+        if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+            define( 'DONOTCACHEPAGE', true );
+        }
+    }
+
+    return '';
+} );
+
+// "Force No-Cache" meta box on posts/pages
+add_action( 'add_meta_boxes', function() {
+    add_meta_box(
+        'mtx_force_nocache',
+        __( 'MTX: Force No-Cache', 'mtx-visibility' ),
+        function( $post ) {
+            $val = get_post_meta( $post->ID, '_mtx_force_nocache', true );
+            wp_nonce_field( 'mtx_force_nocache_nonce', 'mtx_force_nocache_nonce' );
+            echo '<label><input type="checkbox" name="mtx_force_nocache" value="1" ' . checked( $val, '1', false ) . '> ';
+            echo esc_html__( 'Send no-cache headers on this page', 'mtx-visibility' ) . '</label>';
+        },
+        null,
+        'side',
+        'default'
+    );
+} );
+
+add_action( 'save_post', function( $post_id ) {
+    if ( ! isset( $_POST['mtx_force_nocache_nonce'] ) || ! wp_verify_nonce( $_POST['mtx_force_nocache_nonce'], 'mtx_force_nocache_nonce' ) ) {
+        return;
+    }
+    if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+        return;
+    }
+    if ( ! current_user_can( 'edit_post', $post_id ) ) {
+        return;
+    }
+    $val = isset( $_POST['mtx_force_nocache'] ) ? '1' : '';
+    update_post_meta( $post_id, '_mtx_force_nocache', $val );
+} );
+
+// Apply no-cache headers when the flag is on
+add_action( 'send_headers', function() {
+    if ( is_admin() || defined( 'DOING_AJAX' ) ) {
+        return;
+    }
+    if ( ! is_singular() ) {
+        return;
+    }
+    $post_id = get_queried_object_id();
+    if ( ! $post_id ) {
+        return;
+    }
+    if ( '1' !== get_post_meta( $post_id, '_mtx_force_nocache', true ) ) {
+        return;
+    }
+
+    if ( ! headers_sent() ) {
+        nocache_headers();
+        header( 'Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0' );
+        header( 'Pragma: no-cache' );
+        header( 'Vary: Cookie' );
+        if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+            define( 'DONOTCACHEPAGE', true );
+        }
+    }
+}, 0 );
 
 add_shortcode('mtx_vis_debug', function() {
     if ( ! is_user_logged_in() ) return '<pre>Not logged in</pre>';
