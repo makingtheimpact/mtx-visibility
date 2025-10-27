@@ -922,62 +922,54 @@ if ( ! class_exists( 'MTX_Visibility_HTTP' ) ) {
             add_action( 'template_redirect', [ __CLASS__, 'start_buffering' ], 0 );
         }
 
-        private static function scrub_guest_html( string $html ): string {
-            if ( is_user_logged_in() ) {
-                return $html;
-            }
+        private static function scrub_html( string $html ): string {
+            $is_logged_in = is_user_logged_in();
 
-            // Remove any block tagged as MTX:GATED with invert=0 (members-only).
-            // We look for a START tag with JSON payload and the corresponding END tag.
+            // Match any MTX-tagged gated block
             $pattern = '/<!--\s*MTX:GATED START\s+(\{.*?\})\s*-->(.*?)<!--\s*MTX:GATED END\s*-->/si';
 
-            $html = preg_replace_callback( $pattern, function( $m ) {
+            $html = preg_replace_callback( $pattern, function( $m ) use ( $is_logged_in ) {
                 $json = json_decode( $m[1], true );
                 if ( ! is_array( $json ) ) {
-                    // If malformed, fail closed for guests: remove it
+                    // Malformed marker => fail closed (remove block)
                     return '';
                 }
                 $invert = isset( $json['invert'] ) ? (int) $json['invert'] : 0;
 
-                // invert=0 => members-only => guests should NOT see it => strip it
-                // invert=1 => guest-only => guests SHOULD see it => keep it
-                if ( $invert === 0 ) {
+                // Guests: strip members-only (invert=0)
+                if ( ! $is_logged_in && $invert === 0 ) {
                     return '';
                 }
-                return $m[0]; // keep guest-only or anything else
+
+                // Logged-in: strip guest-only (invert=1)
+                if ( $is_logged_in && $invert === 1 ) {
+                    return '';
+                }
+
+                return $m[0]; // keep otherwise
             }, $html );
 
             return $html;
         }
 
         public static function start_buffering(): void {
+            if ( is_admin() || ( defined( 'DOING_AJAX' ) && DOING_AJAX ) ) {
+                return;
+            }
             if ( headers_sent() ) {
                 return;
             }
 
-            // Use a buffer so headers can still be changed after render decisions are made.
+            // Ensure headers are fixed right before send
             if ( function_exists( 'header_register_callback' ) ) {
-                // Register a header callback to run right before headers are sent.
                 header_register_callback( [ __CLASS__, 'maybe_set_no_cache_headers' ] );
             }
 
-            // Start output buffer; passthrough (we only use it to delay headers)
+            // Start a top-level buffer that *filters* all output
             if ( ! ob_get_level() ) {
-                ob_start();
-                // In case someone flushes early, try to set headers on shutdown too
-                add_action( 'shutdown', [ __CLASS__, 'maybe_set_no_cache_headers' ], 0 );
-                add_action( 'shutdown', function() {
-                    // Flush all buffers into one string
-                    $output = '';
-                    while ( ob_get_level() > 0 ) {
-                        $chunk  = ob_get_contents();
-                        $output = ( false === $chunk ? '' : $chunk ) . $output;
-                        @ob_end_clean();
-                    }
-                    // Scrub members-only blocks for guests and echo
-                    $output = MTX_Visibility_HTTP::scrub_guest_html( $output );
-                    echo $output;
-                }, 9999 );
+                ob_start( function( $buffer ) {
+                    return MTX_Visibility_HTTP::scrub_html( $buffer );
+                } );
             }
         }
 
