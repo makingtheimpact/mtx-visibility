@@ -452,10 +452,87 @@ class MTX_Visibility_Elementor {
         add_action( 'elementor/element/column/section_advanced/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
         add_action( 'elementor/element/container/section_layout/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
 
-        add_filter( 'elementor/frontend/widget/should_render', [ __CLASS__, 'should_render' ], 999, 2 );
-        add_filter( 'elementor/frontend/section/should_render', [ __CLASS__, 'should_render' ], 999, 2 );
-        add_filter( 'elementor/frontend/column/should_render', [ __CLASS__, 'should_render' ], 999, 2 );
-        add_filter( 'elementor/frontend/container/should_render', [ __CLASS__, 'should_render' ], 999, 2 );
+        // One universal filter that covers ALL element types (core + third-party)
+        add_filter( 'elementor/frontend/element/should_render', [ __CLASS__, 'should_render' ], 999, 2 );
+
+        // Tag gated elements in the final HTML so we can scrub safely for guests
+        add_action( 'elementor/frontend/before_render', [ __CLASS__, 'before_render' ], 9 );
+        add_action( 'elementor/frontend/after_render',  [ __CLASS__, 'after_render' ], 1000 );
+    }
+
+    /** Compute MTX settings (with inheritance) once for tagging */
+    private static function compute_mtx_settings( $element ): array {
+        $settings = method_exists( $element, 'get_settings_for_display' )
+            ? (array) $element->get_settings_for_display()
+            : (array) ( method_exists( $element, 'get_settings' ) ? $element->get_settings() : [] );
+
+        // inherit from parent if needed
+        $settings = self::inherit_parent_settings( $element, $settings );
+
+        $raw_enable  = $settings['mtx_mepr_enable']  ?? '';
+        $raw_invert  = $settings['mtx_mepr_invert']  ?? '';
+        $ids         = $settings['mtx_mepr_ids']     ?? '';
+        $require     = $settings['mtx_mepr_require'] ?? 'any';
+
+        $enable = self::is_switch_on( $raw_enable );
+        $invert = self::is_switch_on( $raw_invert );
+
+        // auto-enable if IDs present but switch missing
+        if ( ! $enable && is_string( $ids ) && trim( $ids ) !== '' ) {
+            $enable = true;
+        }
+
+        return [
+            'enable'  => $enable,
+            'invert'  => $invert,
+            'ids'     => is_string( $ids ) ? $ids : '',
+            'require' => ( $require === 'all' ? 'all' : 'any' ),
+        ];
+    }
+
+    /** Print a start marker for gated elements so we can scrub on guest responses */
+    public static function before_render( $element ): void {
+        if ( self::is_edit_mode() || ! is_object( $element ) ) {
+            return;
+        }
+
+        $cfg = self::compute_mtx_settings( $element );
+        if ( ! $cfg['enable'] ) {
+            return;
+        }
+
+        // mark page gated for header rules
+        MTX_Visibility_State::$has_gated_elements = true;
+
+        // Tag only if actually “members-only” (invert=0) OR “guest-only” (invert=1)
+        $name = method_exists( $element, 'get_name' ) ? $element->get_name() : 'unknown';
+        $id   = method_exists( $element, 'get_id' )   ? $element->get_id()   : 'n/a';
+
+        $payload = [
+            'name'    => $name,
+            'id'      => $id,
+            'enable'  => $cfg['enable'] ? 1 : 0,
+            'invert'  => $cfg['invert'] ? 1 : 0,
+            'require' => $cfg['require'],
+            'ids'     => $cfg['ids'],
+        ];
+
+        // Emit a compact JSON we can match later
+        echo "\n<!-- MTX:GATED START " . wp_json_encode( $payload ) . " -->\n";
+    }
+
+    /** Close the marker so we can remove the whole block if needed */
+    public static function after_render( $element ): void {
+        if ( self::is_edit_mode() || ! is_object( $element ) ) {
+            return;
+        }
+
+        $cfg = self::compute_mtx_settings( $element );
+        if ( ! $cfg['enable'] ) {
+            return;
+        }
+
+        echo "\n<!-- MTX:GATED END -->\n";
     }
 
     public static function register_controls( $element ): void {
@@ -528,20 +605,12 @@ class MTX_Visibility_Elementor {
             return false;
         }
 
-        $settings = method_exists( $element, 'get_settings_for_display' )
-            ? (array) $element->get_settings_for_display()
-            : (array) $element->get_settings();
+        $cfg = self::compute_mtx_settings( $element );
 
-        $settings = self::inherit_parent_settings( $element, $settings );
-
-        $raw_enable  = $settings['mtx_mepr_enable']  ?? '';
-        $raw_invert  = $settings['mtx_mepr_invert']  ?? '';
-        $ids         = $settings['mtx_mepr_ids']     ?? '';
-        $require     = $settings['mtx_mepr_require'] ?? 'any';
-
-        // Normalize switchers robustly
-        $enable = self::is_switch_on( $raw_enable );
-        $invert = self::is_switch_on( $raw_invert );
+        $enable  = $cfg['enable'];
+        $invert  = $cfg['invert'];
+        $ids     = $cfg['ids'];
+        $require = $cfg['require'];
 
         // Extra hardening for the Post Content widget: deny guests if inherited says so.
         $el_name = method_exists( $element, 'get_name' ) ? $element->get_name() : '';
@@ -558,11 +627,6 @@ class MTX_Visibility_Elementor {
                 ]
             );
             return false;
-        }
-
-        // Safety: if IDs are present but enable not explicitly set, auto-enable.
-        if ( ! $enable && is_string( $ids ) && trim( $ids ) !== '' ) {
-            $enable = true;
         }
 
         // If visibility is enabled on this element, mark page gated (for no-cache header hook)
@@ -858,6 +922,34 @@ if ( ! class_exists( 'MTX_Visibility_HTTP' ) ) {
             add_action( 'template_redirect', [ __CLASS__, 'start_buffering' ], 0 );
         }
 
+        private static function scrub_guest_html( string $html ): string {
+            if ( is_user_logged_in() ) {
+                return $html;
+            }
+
+            // Remove any block tagged as MTX:GATED with invert=0 (members-only).
+            // We look for a START tag with JSON payload and the corresponding END tag.
+            $pattern = '/<!--\s*MTX:GATED START\s+(\{.*?\})\s*-->(.*?)<!--\s*MTX:GATED END\s*-->/si';
+
+            $html = preg_replace_callback( $pattern, function( $m ) {
+                $json = json_decode( $m[1], true );
+                if ( ! is_array( $json ) ) {
+                    // If malformed, fail closed for guests: remove it
+                    return '';
+                }
+                $invert = isset( $json['invert'] ) ? (int) $json['invert'] : 0;
+
+                // invert=0 => members-only => guests should NOT see it => strip it
+                // invert=1 => guest-only => guests SHOULD see it => keep it
+                if ( $invert === 0 ) {
+                    return '';
+                }
+                return $m[0]; // keep guest-only or anything else
+            }, $html );
+
+            return $html;
+        }
+
         public static function start_buffering(): void {
             if ( headers_sent() ) {
                 return;
@@ -875,10 +967,16 @@ if ( ! class_exists( 'MTX_Visibility_HTTP' ) ) {
                 // In case someone flushes early, try to set headers on shutdown too
                 add_action( 'shutdown', [ __CLASS__, 'maybe_set_no_cache_headers' ], 0 );
                 add_action( 'shutdown', function() {
-                    // Ensure buffer is flushed at the very end
+                    // Flush all buffers into one string
+                    $output = '';
                     while ( ob_get_level() > 0 ) {
-                        @ob_end_flush();
+                        $chunk  = ob_get_contents();
+                        $output = ( false === $chunk ? '' : $chunk ) . $output;
+                        @ob_end_clean();
                     }
+                    // Scrub members-only blocks for guests and echo
+                    $output = MTX_Visibility_HTTP::scrub_guest_html( $output );
+                    echo $output;
                 }, 9999 );
             }
         }
