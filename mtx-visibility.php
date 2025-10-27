@@ -15,6 +15,13 @@
  * - User Switching 1.10.0
  */
 
+// Global state to coordinate between Elementor and HTTP layer
+if ( ! class_exists( 'MTX_Visibility_State' ) ) {
+    final class MTX_Visibility_State {
+        public static bool $has_gated_elements = false;
+    }
+}
+
 // If true, any malformed/unknown state fails closed (DENY)
 if ( ! defined( 'MTX_VIS_FAIL_CLOSED' ) ) {
     define( 'MTX_VIS_FAIL_CLOSED', true );
@@ -33,6 +40,7 @@ final class MTX_Visibility_Plugin {
 
     public function init() {
         MTX_Visibility_Engine::boot();
+        MTX_Visibility_HTTP::boot();
 
         if ( did_action( 'elementor/loaded' ) ) {
             MTX_Visibility_Elementor::boot();
@@ -367,8 +375,6 @@ class MTX_Visibility_Engine {
 }
 
 class MTX_Visibility_Elementor {
-    /** Track if page has any gated elements and mark it uncachable. */
-    private static bool $has_gated_elements = false;
 
     /** When present in the URL (…?mtxdiag=1), show badges and log all decisions */
     private static function diag_mode(): bool {
@@ -440,32 +446,7 @@ class MTX_Visibility_Elementor {
         return $settings;
     }
 
-    /** Register header hook to send no-cache headers when gated content detected. */
-    private static function ensure_headers_hook(): void {
-        static $hooked = false;
-        if ( $hooked ) {
-            return;
-        }
-        $hooked = true;
-
-        add_action( 'send_headers', function() {
-            if ( ! is_admin() && ! defined( 'DOING_AJAX' ) && self::$has_gated_elements ) {
-                if ( ! headers_sent() ) {
-                    nocache_headers();
-                    header( 'Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0' );
-                    header( 'Pragma: no-cache' );
-                    header( 'Vary: Cookie' );
-                    if ( ! defined( 'DONOTCACHEPAGE' ) ) {
-                        define( 'DONOTCACHEPAGE', true );
-                    }
-                }
-            }
-        }, 0 );
-    }
-
     public static function boot(): void {
-        self::ensure_headers_hook();
-
         add_action( 'elementor/element/common/section_advanced/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
         add_action( 'elementor/element/section/section_advanced/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
         add_action( 'elementor/element/column/section_advanced/after_section_end', [ __CLASS__, 'register_controls' ], 10, 1 );
@@ -586,7 +567,7 @@ class MTX_Visibility_Elementor {
 
         // If visibility is enabled on this element, mark page gated (for no-cache header hook)
         if ( $enable ) {
-            self::$has_gated_elements = true;
+            MTX_Visibility_State::$has_gated_elements = true;
         }
 
         // Fail-closed: if enabled, not inverted, and user is NOT logged in, deny immediately.
@@ -861,5 +842,72 @@ add_shortcode('mtx_vis_debug', function() {
 
     return '<pre>'.esc_html(print_r($out, true)).'</pre>';
 });
+
+/**
+ * HTTP guard: Starts output buffering and sets headers at emission time based on MTX_Visibility_State.
+ * Ensures caches never store member HTML snapshots.
+ */
+if ( ! class_exists( 'MTX_Visibility_HTTP' ) ) {
+    final class MTX_Visibility_HTTP {
+        public static function boot(): void {
+            if ( is_admin() || ( defined( 'DOING_AJAX' ) && DOING_AJAX ) ) {
+                return;
+            }
+
+            // Start buffering very early in the template lifecycle.
+            add_action( 'template_redirect', [ __CLASS__, 'start_buffering' ], 0 );
+        }
+
+        public static function start_buffering(): void {
+            if ( headers_sent() ) {
+                return;
+            }
+
+            // Use a buffer so headers can still be changed after render decisions are made.
+            if ( function_exists( 'header_register_callback' ) ) {
+                // Register a header callback to run right before headers are sent.
+                header_register_callback( [ __CLASS__, 'maybe_set_no_cache_headers' ] );
+            }
+
+            // Start output buffer; passthrough (we only use it to delay headers)
+            if ( ! ob_get_level() ) {
+                ob_start();
+                // In case someone flushes early, try to set headers on shutdown too
+                add_action( 'shutdown', [ __CLASS__, 'maybe_set_no_cache_headers' ], 0 );
+                add_action( 'shutdown', function() {
+                    // Ensure buffer is flushed at the very end
+                    while ( ob_get_level() > 0 ) {
+                        @ob_end_flush();
+                    }
+                }, 9999 );
+            }
+        }
+
+        public static function maybe_set_no_cache_headers(): void {
+            // Only act on front-end document responses
+            if ( is_admin() || ( defined( 'DOING_AJAX' ) && DOING_AJAX ) ) {
+                return;
+            }
+
+            // If any MTX-enabled element rendered, force private/no-store and Vary: Cookie
+            if ( MTX_Visibility_State::$has_gated_elements ) {
+                // Remove any pre-existing cache headers that might have been set earlier
+                if ( function_exists( 'header_remove' ) ) {
+                    @header_remove( 'Cache-Control' );
+                    @header_remove( 'Pragma' );
+                    @header_remove( 'Expires' );
+                }
+                // Send strict headers
+                @nocache_headers();
+                @header( 'Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0', true );
+                @header( 'Pragma: no-cache', true );
+                @header( 'Vary: Cookie', false );
+                if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+                    define( 'DONOTCACHEPAGE', true );
+                }
+            }
+        }
+    }
+}
 
 new MTX_Visibility_Plugin();
