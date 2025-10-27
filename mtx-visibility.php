@@ -370,6 +370,34 @@ class MTX_Visibility_Elementor {
     /** Track if page has any gated elements and mark it uncachable. */
     private static bool $has_gated_elements = false;
 
+    /** When present in the URL (…?mtxdiag=1), show badges and log all decisions */
+    private static function diag_mode(): bool {
+        return isset( $_GET['mtxdiag'] ) && $_GET['mtxdiag'] == '1';
+    }
+
+    /** Render a small badge next to the element in diag mode */
+    private static function diag_badge( $element, array $info ): void {
+        if ( ! self::diag_mode() ) {
+            return;
+        }
+
+        $name = method_exists( $element, 'get_name' ) ? $element->get_name() : 'unknown';
+        $id   = method_exists( $element, 'get_id' ) ? $element->get_id() : 'n/a';
+        $text = sprintf(
+            'MTX[%s #%s] %s | enable=%s ids="%s" require=%s invert=%s | user=%d',
+            esc_html( $name ),
+            esc_html( $id ),
+            $info['decision'] ? 'ALLOW' : 'DENY',
+            $info['enable'] ? '1' : '0',
+            esc_html( is_string( $info['ids'] ) ? $info['ids'] : json_encode( $info['ids'] ) ),
+            $info['require'] === 'all' ? 'all' : 'any',
+            $info['invert'] ? '1' : '0',
+            (int) get_current_user_id()
+        );
+        echo '<div style="position:relative;z-index:9999;"><div style="display:inline-block;padding:2px 6px;margin:2px 0;border:1px solid #c00;border-radius:3px;font:12px/1.2 monospace;background:#fff;color:#c00;">'
+            . $text . '</div></div>';
+    }
+
     /** Normalize Elementor switchers: accept 'yes' | '1' | 1 | true */
     private static function is_switch_on( $val ): bool {
         return ( $val === 'yes' || $val === '1' || $val === 1 || $val === true );
@@ -380,6 +408,36 @@ class MTX_Visibility_Elementor {
         if ( current_user_can( 'manage_options' ) ) {
             echo "\n<!-- MTX {$text} -->\n";
         }
+    }
+
+    /** If an element has no MTX controls, inherit from closest parent that does */
+    private static function inherit_parent_settings( $element, array $settings ): array {
+        // If element already has enable set explicitly, keep it.
+        $has_own = isset( $settings['mtx_mepr_enable'] ) && $settings['mtx_mepr_enable'] !== '';
+        if ( $has_own ) {
+            return $settings;
+        }
+
+        // Walk up parents to find first with our controls
+        if ( ! method_exists( $element, 'get_parent' ) ) {
+            return $settings;
+        }
+        $parent = $element->get_parent();
+        while ( $parent && is_object( $parent ) ) {
+            $ps = method_exists( $parent, 'get_settings_for_display' )
+                ? (array) $parent->get_settings_for_display()
+                : (array) ( method_exists( $parent, 'get_settings' ) ? $parent->get_settings() : [] );
+            if ( isset( $ps['mtx_mepr_enable'] ) && $ps['mtx_mepr_enable'] !== '' ) {
+                // Inherit these down
+                $settings['mtx_mepr_enable']  = $ps['mtx_mepr_enable'];
+                $settings['mtx_mepr_ids']     = $settings['mtx_mepr_ids']     ?? ( $ps['mtx_mepr_ids'] ?? '' );
+                $settings['mtx_mepr_require'] = $settings['mtx_mepr_require'] ?? ( $ps['mtx_mepr_require'] ?? 'any' );
+                $settings['mtx_mepr_invert']  = $settings['mtx_mepr_invert']  ?? ( $ps['mtx_mepr_invert'] ?? '' );
+                break;
+            }
+            $parent = method_exists( $parent, 'get_parent' ) ? $parent->get_parent() : null;
+        }
+        return $settings;
     }
 
     /** Register header hook to send no-cache headers when gated content detected. */
@@ -493,6 +551,8 @@ class MTX_Visibility_Elementor {
             ? (array) $element->get_settings_for_display()
             : (array) $element->get_settings();
 
+        $settings = self::inherit_parent_settings( $element, $settings );
+
         $raw_enable  = $settings['mtx_mepr_enable']  ?? '';
         $raw_invert  = $settings['mtx_mepr_invert']  ?? '';
         $ids         = $settings['mtx_mepr_ids']     ?? '';
@@ -501,6 +561,23 @@ class MTX_Visibility_Elementor {
         // Normalize switchers robustly
         $enable = self::is_switch_on( $raw_enable );
         $invert = self::is_switch_on( $raw_invert );
+
+        // Extra hardening for the Post Content widget: deny guests if inherited says so.
+        $el_name = method_exists( $element, 'get_name' ) ? $element->get_name() : '';
+        if ( $el_name === 'post-content' && $enable && ! $invert && ! is_user_logged_in() ) {
+            self::admin_comment( 'DENY post-content via inherited container settings' );
+            self::diag_badge(
+                $element,
+                [
+                    'decision' => false,
+                    'enable'   => $enable,
+                    'ids'      => $ids,
+                    'require'  => $require,
+                    'invert'   => $invert,
+                ]
+            );
+            return false;
+        }
 
         // Safety: if IDs are present but enable not explicitly set, auto-enable.
         if ( ! $enable && is_string( $ids ) && trim( $ids ) !== '' ) {
@@ -540,6 +617,18 @@ class MTX_Visibility_Elementor {
                 $invert ? '1' : '0',
                 (int) get_current_user_id()
             )
+        );
+
+        // Visible badge in ?mtxdiag=1 mode so we can see what was decided for THIS element
+        self::diag_badge(
+            $element,
+            [
+                'decision' => $decision,
+                'enable'   => $enable,
+                'ids'      => $ids,
+                'require'  => $require === 'all' ? 'all' : 'any',
+                'invert'   => $invert,
+            ]
         );
 
         return $decision ? $should_render : false;
